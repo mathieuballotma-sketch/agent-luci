@@ -1,32 +1,29 @@
+# Environnements
+venv/
+venv311/
+.venv/
+
+# Données personnelles
+Lucid_Docs/
+chroma_data/
+data/
+backup_old/
+rag_data/
+logs/
+
+# Fichiers sensibles
+config.yaml
+.env
+short_term_memory.json
+*.json
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.env
-config.yaml
 *.db
 *.sqlite
-chroma_db/
-faiss_index/
+
+# Mac
 .DS_Store
 *.log
-venv/
-.venv/
-venv311/
-__pycache__/
-*.pyc
-.env
-config.yaml
-*.db
-.DS_Store
-*.log
-chroma_data/
-data/
-Lucid_Docs/
-backup_old/
-short_term_memory.json
-*.json
-chroma_data/
-data/
-Lucid_Docs/
-backup_old/
-short_term_memory.json
