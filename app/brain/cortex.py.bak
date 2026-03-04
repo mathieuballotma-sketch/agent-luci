@@ -1,0 +1,144 @@
+import time
+import json
+import re
+from typing import List, Optional, Tuple, Dict, Any
+from ..providers.manager import ProviderManager
+from ..services.prompt_cache import PromptCache
+from ..services.web_search import WebSearch
+from ..utils.logger import logger
+from app.agents.base_agent import BaseAgent
+from app.agents.reminder_agent import ReminderAgent
+from app.agents.knowledge_agent import KnowledgeAgent
+from app.agents.document_agent import DocumentAgent
+from app.agents.vision.text_extractor import TextExtractorAgent
+from app.brain.synapses.event_bus import EventBus
+
+class FrontalCortex:
+    def __init__(self, manager: ProviderManager, bus, event_bus: EventBus, prompt_cache: PromptCache, config: dict):
+        self.manager = manager
+        self.bus = bus
+        self.event_bus = event_bus
+        self.prompt_cache = prompt_cache
+        self.config = config
+        self.web_search = WebSearch() if config.get("web_search", True) else None
+        self.agents: Dict[str, BaseAgent] = {}
+        self._register_agents()
+        self.default_system = "Tu es un assistant IA utile, amical et concis."
+
+    def _register_agents(self):
+        agents_list = [
+            ReminderAgent(self.manager, self.bus, {}),
+            KnowledgeAgent(self.manager, self.bus, {
+                "max_results": 3,
+                "web_search": self.web_search,
+                "news_api_key": self.config.get("api_keys", {}).get("news_api_key")
+            }),
+            DocumentAgent(self.manager, self.bus, {"web_search": self.web_search}),
+            TextExtractorAgent(self.manager, self.bus, self.config.get("vision", {})),
+        ]
+        for agent in agents_list:
+            self.agents[agent.name] = agent
+        logger.info(f"🧠 Cortex initialisé avec {len(self.agents)} agents : {list(self.agents.keys())}")
+
+    def think(self, query: str, system_prompt: Optional[str] = None, allow_web_search: bool = True) -> Tuple[str, float]:
+        start = time.time()
+        logger.info(f"🧠 think() - Requête: {query[:50]}...")
+
+        # Vérifier le cache
+        cached = self.prompt_cache.get(query, system=self.default_system, model="balanced")
+        if cached:
+            logger.info("🎯 Réponse trouvée en cache")
+            return cached, time.time() - start
+
+        # Générer un plan
+        plan = self._generate_plan(query)
+        if not plan:
+            response = self._generate(query, self.default_system, model="balanced")
+            self.prompt_cache.put(query, self.default_system, "balanced", response)
+            return response, time.time() - start
+
+        # Exécuter le plan séquentiellement (pour l'instant)
+        results = []
+        context = query
+        for i, step in enumerate(plan):
+            logger.info(f"Étape {i+1}/{len(plan)}")
+            result, success = self._execute_step(step, context)
+            if not success:
+                return f"Échec à l'étape {i+1} : {result}", time.time() - start
+            results.append(result)
+            context = result
+
+        # Synthèse si plusieurs étapes
+        if len(results) == 1:
+            final_response = results[0]
+        else:
+            final_response = self._synthesize(query, results)
+
+        # Mettre en cache
+        self.prompt_cache.put(query, self.default_system, "balanced", final_response)
+        return final_response, time.time() - start
+
+    def _generate_plan(self, query: str) -> Optional[List[Dict]]:
+        agents_desc = self._build_agents_description()
+        system_prompt = f"""Tu es un planificateur. Agents disponibles :
+{agents_desc}
+
+Produis un plan JSON pour répondre à la requête.
+Format : [{{"agent": "nom", "tool": "outil", "parameters": {{...}}, "description": "..."}}]
+Si la requête ne nécessite qu'une réponse simple, retourne [].
+Exemples :
+- "quel temps fait-il ?" -> []
+- "recherche le cours de l'or et crée un document" -> [{{"agent": "KnowledgeAgent", "tool": "web_search", "parameters": {{"query": "cours or 2026"}}}}, {{"agent": "DocumentAgent", "tool": "create_word_document", "parameters": {{"title": "Cours or", "content": "{{context}}"}}}}]
+"""
+        user_prompt = f"Requête : {query}"
+        try:
+            response = self.manager.generate(user_prompt, system=system_prompt, model="balanced")
+            cleaned = response.strip().replace("```json", "").replace("```", "").strip()
+            match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+            if match:
+                plan = json.loads(match.group())
+                if isinstance(plan, list):
+                    return plan
+        except Exception as e:
+            logger.error(f"Erreur plan: {e}")
+        return None
+
+    def _build_agents_description(self) -> str:
+        desc = []
+        for name, agent in self.agents.items():
+            tools = ", ".join([t.name for t in agent.get_tools()])
+            desc.append(f"- {name}: {agent.__doc__ or ''} Outils: {tools}")
+        return "\n".join(desc)
+
+    def _execute_step(self, step: Dict, context: str) -> Tuple[str, bool]:
+        agent_name = step.get("agent")
+        tool_name = step.get("tool")
+        params = step.get("parameters", {}).copy()
+        if context:
+            for k, v in params.items():
+                if isinstance(v, str):
+                    params[k] = v.replace("{{context}}", context)
+        agent = self.agents.get(agent_name)
+        if not agent:
+            return f"Agent {agent_name} inconnu", False
+        try:
+            if tool_name:
+                result = agent.execute_tool(tool_name, params)
+            else:
+                result = agent.handle(params.get("query", ""))
+            return result, True
+        except Exception as e:
+            return f"Erreur: {e}", False
+
+    def _generate(self, prompt: str, system: str, model="balanced") -> str:
+        try:
+            return self.manager.generate(prompt, system=system, model=model)
+        except Exception as e:
+            return f"Erreur LLM: {e}"
+
+    def _synthesize(self, query: str, results: List[str]) -> str:
+        prompt = f"Résultats pour '{query}':\n" + "\n".join(results) + "\nSynthèse concise :"
+        return self._generate(prompt, self.default_system, model="balanced")
+
+    def stop(self):
+        logger.info("Cortex arrêté.")

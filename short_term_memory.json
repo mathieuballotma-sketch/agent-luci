@@ -1,0 +1,188 @@
+[
+  {
+    "query": "comment va tu",
+    "response": "Je suis bien merci ! Comment puis-je vous aider aujourd'hui ?",
+    "agent": "general",
+    "timestamp": 1771515639.766127
+  },
+  {
+    "query": "mes moi une note de rappellez le docteur",
+    "response": "\u2705 Rappel cr\u00e9\u00e9 : mes moi une note de rappellez le docteur",
+    "agent": "ReminderAgent",
+    "timestamp": 1771515653.6469278
+  },
+  {
+    "query": "cr\u00e9e moi un document word sur les effet de la cigarette sur le corp",
+    "response": "Je ne sais pas\n\nACTION: create_word_document|Effet de la cigarette sur le corps",
+    "agent": "general",
+    "timestamp": 1771515674.066991
+  },
+  {
+    "query": "que voit tu sur l'ecran",
+    "response": "Sur l'\u00e9cran, je vois divers \u00e9l\u00e9ments li\u00e9s \u00e0 un assistant IA. Il y a des r\u00f4les comme @ deepseek et @ Agent IA avec des messages de conversation entre eux. De plus, il y a des t\u00e2ches comme cr\u00e9er une note de rappel pour voir le m\u00e9decin aujourd'hui, ainsi que plusieurs messages indiquant des probl\u00e8mes r\u00e9solus ou \u00e0 r\u00e9soudre li\u00e9s \u00e0 la fen\u00eatre macOS et son comportement. Il y aussi une mention de faire un document Word sur les effets de la cigarette sur le corps et d'autres t\u00e2ches non sp\u00e9cifi\u00e9es comme la correction de bugs, le lancement de programmes et la cr\u00e9ation d'un message. De plus, il semble qu'il soit pr\u00eat \u00e0 prendre des nouvelles actions.",
+    "agent": "general",
+    "timestamp": 1771515826.577015
+  },
+  {
+    "query": "qu'elle sont toute les action que tu peut faire sur mon ordinateur",
+    "response": "Je ne sais pas.",
+    "agent": "general",
+    "timestamp": 1771515867.381189
+  },
+  {
+    "query": "commetn sa tu ne sais pas",
+    "response": "Je ne sais pas.",
+    "agent": "general",
+    "timestamp": 1771515875.3149672
+  },
+  {
+    "query": "arrete de dire je ne sais pas",
+    "response": "Je ne sais pas",
+    "agent": "general",
+    "timestamp": 1771515881.115157
+  },
+  {
+    "query": "qu'elle est la capital de la chine",
+    "response": "Je ne sais pas. La question vis\u00e9e n'est pas li\u00e9e au contexte visuel fourni et demande plut\u00f4t la capitale de la Chine, qui est P\u00e9kin (anciennement nomm\u00e9e Pekin).",
+    "agent": "general",
+    "timestamp": 1771515902.145535
+  },
+  {
+    "query": "est ce que tu te fis que au contexte visuel",
+    "response": "Je ne sais pas. Le contexte visuel n'a pas fourni d'informations pour r\u00e9pondre \u00e0 cette question.",
+    "agent": "general",
+    "timestamp": 1771515920.012158
+  },
+  {
+    "query": "bonjour",
+    "response": "Bonjour! Comment puis-je vous aider aujourd'hui?",
+    "agent": "general",
+    "timestamp": 1771544443.80242
+  },
+  {
+    "query": "fait moi un document word avec comme titre le rein je veut que tu explique a quoi il servent et les lien qu'il a avec les autre organes et tu peut faire des recherche",
+    "response": "Je ne sais pas\n\nACTION: create_note|Titre de la note|Rein: Fonction, Liens avec d'autres Organs et Recherche",
+    "agent": "general",
+    "timestamp": 1771544486.685458
+  },
+  {
+    "query": "fait moi un document woed comme titre bonjour",
+    "response": "ACTION: create_word_document|bonjour|Je suis ravi de vous accueillir. C'est un plaisir de pouvoir aider avec vos besoins aujourd'hui. Que puis-je faire pour vous?",
+    "agent": "general",
+    "timestamp": 1771545442.762722
+  },
+  {
+    "query": "quesque tu a compris sur la lign de code 59 a 87 de engine",
+    "response": "Je ne sais pas\n\nLa ligne de code 59 \u00e0 87 se trouve dans le fichier `engine.py`, mais je n'ai pas assez d'informations pour d\u00e9tailler ce qui se passe pr\u00e9cis\u00e9ment. Je ne peux pas effectuer une recherche directe sans pouvoir acc\u00e9der au code r\u00e9el.",
+    "agent": "general",
+    "timestamp": 1771545515.064765
+  },
+  {
+    "query": "avec ton contexte viseulle",
+    "response": "Je vais analyser le contexte visuel que vous avez fourni pour r\u00e9pondre \u00e0 votre question. Votre contexte visuel semble \u00eatre une liste de fichiers et d'importations dans un environnement de d\u00e9veloppement Python, probablement li\u00e9 \u00e0 une IA agent comme LUCIDE.\n\nPour r\u00e9sumer ce qu'on peut voir :\n- Il y a des fichiers import\u00e9s comme `cortex.py`, `memory.py`, `engine.py` etc.\n- Certains fichiers semblent \u00eatre des fichiers d'initialisation (`init_.py`) et de structure (`STRUCTURE`).\n- Il y a un fichier appel\u00e9 `main_hud.py`.\n- Il semble avoir une gestionnaire d'actions, un router actions, et probablement un syst\u00e8me de bus qui g\u00e8re les messages ou l'\u00e9change entre diff\u00e9rents composants.\n\nSans plus de d\u00e9tails sur la question sp\u00e9cifique que vous avez, je vais r\u00e9pondre par hypoth\u00e8se. Si votre question est \u00e0 propos du fonctionnement global de ce contexte visuel :\n\n- `main_hud.py` semble \u00eatre le point d'entr\u00e9e pour un agent IA appel\u00e9 Lucide.\n- Les fichiers comme `cortex.py`, `memory.py`, et `engine.py` impl\u00e9mentent diff\u00e9rentes fonctions, par exemple `LucidEngine.process` qui g\u00e8re la prise en compte des requ\u00eates de l'utilisateur via le cortex (comme une fonction de pens\u00e9e ou analyse) et retourne une r\u00e9ponse.\n- Le fichier `main_hud.py` pourrait initier ces composants et les coordonner.\n\nSi vous avez une question sp\u00e9cifique par rapport \u00e0 un \u00e9l\u00e9ment dans ce contexte visuel, n'h\u00e9sitez pas \u00e0 me demander plus en d\u00e9tail.",
+    "agent": "general",
+    "timestamp": 1771545548.082079
+  },
+  {
+    "query": "cr\u00e9e moi un document word avec comme titre bonjour",
+    "response": "ACTION: create_word_document|Bonjour|Voici le d\u00e9but de mon document : \"Bonjour\"",
+    "agent": "general",
+    "timestamp": 1771545688.419817
+  },
+  {
+    "query": "recrree moi le document word",
+    "response": "Je ne sais pas",
+    "agent": "general",
+    "timestamp": 1771545730.6201138
+  },
+  {
+    "query": "cree moi un documetn word sur le rien",
+    "response": "ACTION: create_word_document|Cr\u00e9ation automatique du document|Contenu g\u00e9n\u00e9r\u00e9 automatiquement bas\u00e9 sur le contexte visuel donn\u00e9.",
+    "agent": "general",
+    "timestamp": 1771545742.92605
+  },
+  {
+    "query": "que voit tu sur mon ecran",
+    "response": "Je ne sais pas.",
+    "agent": "general",
+    "timestamp": 1771576651.63872
+  },
+  {
+    "query": "que voit tu sur ma fenetre vs code dit moi se qe tu a compris d'apres les lgnes de code",
+    "response": "Je ne sais pas\n\nLignes de code du contexte visuel :\n- vision.py \u2014 mon-agence-ia\n- vision.py \u2014 mon-agence-ia",
+    "agent": "general",
+    "timestamp": 1771576940.102195
+  },
+  {
+    "query": "comment va tu aujourd'hui",
+    "response": "Je ne sais pas. Le contexte visuel n'est pas pertinent pour r\u00e9pondre \u00e0 votre question sur comment je vais aujourd'hui.",
+    "agent": "general",
+    "timestamp": 1771576979.39611
+  },
+  {
+    "query": "fait une recherche sur le cour de l'or",
+    "response": "ACTION: create_note|Recherche du cours de l'or|Je vais cr\u00e9er une note pour suivre la derni\u00e8re information sur le cours de l'or. Si vous avez besoin de plus d'aide, n'h\u00e9sitez pas!",
+    "agent": "general",
+    "timestamp": 1771580594.5489678
+  },
+  {
+    "query": "comment va tu",
+    "response": "Je vais bien, merci pour demander ! Et vous, comment allez-vous ?",
+    "agent": "general",
+    "timestamp": 1771580639.079821
+  },
+  {
+    "query": "je vais bien peut tu me faire un document word sur le rein et qui explique avec qu'elle autre organe il est lier",
+    "response": "ACTION: create_word_document|Rein et ses liaisons organiques|Le rein, comme nombreux autres organs du corps humain, est li\u00e9 \u00e0 de nombreuses autres structures et syst\u00e8mes. Cet article vise \u00e0 vous fournir une compr\u00e9hension plus approfondie de cette relation.",
+    "agent": "general",
+    "timestamp": 1771580667.0324538
+  },
+  {
+    "query": "fait moi une recherche sur le cour de l'or",
+    "response": "ACTION: search|Cour d'or|\u00e9conomie",
+    "agent": "general",
+    "timestamp": 1771581570.237916
+  },
+  {
+    "query": "peut tu me dire les actualiter sur le cour de l'or",
+    "response": "Je suis d\u00e9sol\u00e9 pour la confusion, mais je n'ai pas la capacit\u00e9 d'afficher des \u00e9crans ou de fournir des informations en temps r\u00e9el. Je ne peux pas acc\u00e9der au contexte visuel que vous m'avez fourni. En ce qui concerne les actualit\u00e9s du cours de l'or, je pourrais essayer de chercher cela pour vous via une recherche web, si c'est ce dont vous avez besoin.",
+    "agent": "general",
+    "timestamp": 1771581597.741893
+  },
+  {
+    "query": "tu a juste a ire une rechere et me donner un reponse",
+    "response": "D'accord, je vais chercher des informations pertinentes sur \"recherche\" dans le contexte de \"cortex.py\" pour vous.",
+    "agent": "general",
+    "timestamp": 1771581613.554774
+  },
+  {
+    "query": "mes moi un rappel de racheter des gla\u00e7pons",
+    "response": "\u2705 Rappel cr\u00e9\u00e9 : mes moi un rappel de racheter des gla\u00e7pons",
+    "agent": "ReminderAgent",
+    "timestamp": 1771581669.857997
+  },
+  {
+    "query": "fait moi un document word sur la france",
+    "response": "Je ne peux malheureusement pas cr\u00e9er directement de documents Word via cette interface. Cependant, je pourrais proposer une structure ou quelques \u00e9l\u00e9ments \u00e0 inclure dans votre document. Comment souhaitez-vous commencer ?",
+    "agent": "general",
+    "timestamp": 1771583521.6405509
+  },
+  {
+    "query": "cr\u00e9e moi un document word sur la france",
+    "response": "\u2705 Document Word cr\u00e9\u00e9 : La_France.docx (une notification a \u00e9t\u00e9 envoy\u00e9e)",
+    "agent": "DocumentAgent",
+    "timestamp": 1771583821.230423
+  },
+  {
+    "query": "fait une recherche sur le cour de l'or puis fait un document word qui resume le cour de l'or",
+    "response": "\u2705 Document Word cr\u00e9\u00e9 : Cour_de_L'Or.docx (une notification a \u00e9t\u00e9 envoy\u00e9e)",
+    "agent": "DocumentAgent",
+    "timestamp": 1771584812.798455
+  },
+  {
+    "query": "fairt une recherche sur le l'actualiter et fait en moi un resumer",
+    "response": "\u26a0\ufe0f Cl\u00e9 API NewsAPI non configur\u00e9e.",
+    "agent": "KnowledgeAgent",
+    "timestamp": 1771585204.593944
+  }
+]

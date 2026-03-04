@@ -1,0 +1,107 @@
+from typing import Optional, Tuple
+from pathlib import Path
+from ..core.config import Config
+from ..providers.manager import ProviderManager
+from app.brain.cortex import FrontalCortex
+from app.brain.synapses.bus import SynapseBus
+from app.brain.synapses.event_bus import EventBus
+from app.services.rag import RAGService
+from app.services.prompt_cache import PromptCache
+from app.actions.system import SystemActions
+from app.actions.writer import WriterAgent
+from app.actions.router import ActionRouter
+from app.core.executor import TaskExecutor
+from app.utils.circuit_breaker import CircuitBreaker
+from ..utils.logger import logger
+
+class LucidEngine:
+    def __init__(self, config: Config):
+        self.config = config
+        self.bus = SynapseBus()
+        self.event_bus = EventBus()
+        self._init_llm()
+        
+        # Nouveaux composants
+        data_dir = Path(config.app.data_dir)
+        self.executor = TaskExecutor(max_workers=3, persist_path=data_dir / "tasks.pkl")
+        self.prompt_cache = PromptCache(cache_dir=data_dir / "cache", max_size=10000)
+        self.ollama_circuit = CircuitBreaker("ollama", failure_threshold=3, recovery_timeout=30)
+        
+        # Cortex avec accès aux nouveaux composants
+        self.cortex = FrontalCortex(
+            manager=self.manager,
+            bus=self.bus,
+            event_bus=self.event_bus,
+            prompt_cache=self.prompt_cache,
+            config={}
+        )
+        
+        # Services existants
+        self.rag = RAGService(config.rag)
+        self.system_actions = SystemActions()
+        self.writer_agent = WriterAgent(str(config.actions.word_output_dir))
+        self.action_router = ActionRouter(self.system_actions, self.writer_agent)
+        
+        logger.info("✅ Moteur Lucide initialisé avec TaskExecutor, PromptCache, CircuitBreaker")
+
+    def _init_llm(self):
+        models_config = {}
+        for key, m in self.config.llm.models.items():
+            models_config[key] = {
+                'name': m.name,
+                'max_tokens': m.max_tokens,
+                'temperature': m.temperature
+            }
+        self.manager = ProviderManager({
+            "host": self.config.llm.host,
+            "models": models_config,
+            "timeout": self.config.llm.timeout,
+            "retry_attempts": self.config.llm.retry_attempts,
+            "retry_delay": self.config.llm.retry_delay
+        })
+
+    def process(self, query: str, system_prompt: Optional[str] = None, use_rag: bool = True, allow_web_search: bool = True) -> Tuple[str, float]:
+        import time
+        start = time.time()
+        logger.info(f"⚙️ Engine.process() - Requête: {query[:50]}...")
+        
+        # Contexte RAG
+        rag_context = self.rag.query(query) if use_rag else ""
+        full_context = ""
+        if rag_context:
+            full_context += f"Documents pertinents:\n{rag_context}\n\n"
+        
+        # Appel au cortex protégé par circuit breaker
+        try:
+            raw_response, _ = self.ollama_circuit.call(
+                lambda: self.cortex.think(
+                    query,
+                    system_prompt=system_prompt,
+                    allow_web_search=allow_web_search
+                )
+            )
+        except Exception as e:
+            logger.error(f"Erreur après circuit breaker: {e}")
+            return f"Erreur de communication avec le LLM: {e}", time.time() - start
+
+        # Routage des actions
+        action_executed, final_response = self.action_router.parse_and_execute(raw_response)
+        
+        latency = time.time() - start
+        if action_executed:
+            logger.info(f"Action exécutée en {latency:.2f}s")
+        else:
+            logger.info(f"Réponse générée en {latency:.2f}s")
+        
+        return final_response, latency
+
+    def index_file(self, path: str) -> bool:
+        return self.rag.index_file(path)
+
+    def index_folder(self, path: str) -> int:
+        return self.rag.index_folder(path)
+
+    def stop(self):
+        self.executor.shutdown()
+        self.cortex.stop()
+        logger.info("Moteur arrêté.")
