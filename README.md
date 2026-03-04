@@ -7,7 +7,7 @@
 
 ## 🌱 Un mot honnête avant tout
 
-Ce projet a démarré début février 2025. Il a **moins de 2 mois d'existence**.
+Ce projet a démarré début février 2026. Il a **moins de 2 mois d'existence**.
 
 Je suis seul à le développer, brique par brique, en testant chaque composant avant de passer au suivant. La base est là et elle fonctionne — mais soyons clairs : **il reste beaucoup de travail**. Des bugs existent, certaines fonctionnalités sont encore fragiles, la documentation est incomplète, et l'architecture continue d'évoluer chaque jour.
 
