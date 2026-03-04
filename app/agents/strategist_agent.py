@@ -1,17 +1,16 @@
 """
 Agent Stratège : analyse le contexte et propose des automatisations.
 Tourne périodiquement et publie ses suggestions sur le bus d'événements.
+Version avec deux modes : quick (rapide, peu de données) et deep (complet).
 """
 
 import asyncio
-import json
-from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 
 from app.agents.base_agent import BaseAgent
 from app.utils.logger import logger
-from app.utils.metrics import record_tool_execution
+from app.utils.metrics import strategist_suggestions_total
 
 
 class SuggestionContract(BaseModel):
@@ -19,11 +18,11 @@ class SuggestionContract(BaseModel):
     title: str = Field(..., description="Titre court de la suggestion")
     description: str = Field(..., description="Description détaillée")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Niveau de confiance (0-1)")
-    suggested_trigger: Optional[str] = Field(None, description="Déclencheur suggéré (ex: 'tous les lundis à 9h')")
-    suggested_action: Optional[str] = Field(None, description="Action suggérée (ex: 'ouvrir Notes et créer une nouvelle note')")
-    category: str = Field("productivity", description="Catégorie (productivity, organisation, etc.)")
-    cron_expression: Optional[str] = Field(None, description="Expression cron si récurrent")
+    category: str = Field("productivity", description="Catégorie (productivity, organization, information, etc.)")
+    cron_expression: Optional[str] = Field(None, description="Expression cron si tâche récurrente")
     query: Optional[str] = Field(None, description="Requête à exécuter pour la tâche")
+    suggested_trigger: Optional[str] = Field(None, description="Description textuelle du déclencheur")
+    suggested_action: Optional[str] = Field(None, description="Description textuelle de l'action")
 
 
 class StrategistAgent(BaseAgent):
@@ -41,7 +40,7 @@ class StrategistAgent(BaseAgent):
         self.min_interval = config.get("strategist_interval", 3600)  # 1h par défaut
 
     def get_tools(self) -> list:
-        return []  # Pas d'outils exposés
+        return []  # Pas d'outils exposés aux utilisateurs
 
     def can_handle(self, query: str) -> bool:
         return False  # Non destiné à l'utilisateur
@@ -49,20 +48,37 @@ class StrategistAgent(BaseAgent):
     async def handle(self, query: str) -> str:
         return "L'agent Stratège n'est pas destiné à être utilisé directement."
 
-    async def run_periodic_review(self):
-        """Méthode appelée périodiquement pour analyser et proposer."""
-        logger.info("🔍 Lancement de l'analyse stratégique...")
-        suggestions = await self._analyze()
+    async def run_periodic_review(self, mode: str = "balanced"):
+        """
+        Lance l'analyse stratégique.
+        mode: "quick" (analyse rapide, peu de données), "deep" (analyse complète), "balanced" (compromis).
+        """
+        logger.info(f"🔍 Lancement de l'analyse stratégique (mode {mode})...")
+        suggestions = await self._analyze(mode)
         for sug in suggestions:
             await self._publish_suggestion(sug)
         logger.info(f"✅ Analyse terminée, {len(suggestions)} suggestion(s) publiée(s)")
 
-    async def _analyze(self) -> List[Dict[str, Any]]:
-        """Analyse le contexte et retourne une liste de suggestions."""
-        # Récupérer le contexte récent
-        working_context = self.memory.get_working_context(n=10)
-        # Récupérer des souvenirs épisodiques similaires (optionnel)
-        similar = self.memory.remember("stratégie automatisation", n_results=3)
+    async def _analyze(self, mode: str = "balanced") -> List[Dict[str, Any]]:
+        """
+        Analyse le contexte récent (mémoire de travail) et les souvenirs épisodiques
+        pour générer des suggestions pertinentes.
+        """
+        if mode == "quick":
+            working_context = self.memory.get_working_context(n=5)
+            similar = []  # pas de recherche épisodique
+            max_tokens = 256
+            temperature = 0.5
+        elif mode == "deep":
+            working_context = self.memory.get_working_context(n=20)
+            similar = self.memory.remember("stratégie automatisation", n_results=5)
+            max_tokens = 512
+            temperature = 0.7
+        else:  # balanced
+            working_context = self.memory.get_working_context(n=10)
+            similar = self.memory.remember("stratégie automatisation", n_results=3)
+            max_tokens = 384
+            temperature = 0.6
 
         prompt = f"""
 [Rôle] Tu es un stratège personnel. Ton objectif est d'augmenter la productivité de l'utilisateur en proposant des automatisations et des rappels.
@@ -95,7 +111,11 @@ Exemple:
 Si aucune idée, retourne [].
 """
         try:
-            response = await self.ask_llm_async(prompt, temperature=0.5, max_tokens=512)
+            response = await self.ask_llm_async(
+                prompt,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
             data = self.extract_json_from_response(response)
             if isinstance(data, list):
                 return data
@@ -107,15 +127,14 @@ Si aucune idée, retourne [].
             return []
 
     async def _publish_suggestion(self, suggestion: Dict[str, Any]):
-        """Publie une suggestion sur le bus d'événements."""
+        """Publie une suggestion sur le bus d'événements et incrémente une métrique."""
         try:
-            # Valider avec le contrat (optionnel)
-            # Pour l'instant, on publie brut
             await self.event_bus.publish(
                 event_type="strategist.suggestion",
                 data=suggestion,
                 source=self.name
             )
             logger.info(f"💡 Suggestion publiée: {suggestion.get('title')}")
+            strategist_suggestions_total.labels(category=suggestion.get("category", "other")).inc()
         except Exception as e:
             logger.error(f"Erreur publication suggestion: {e}")

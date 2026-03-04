@@ -63,7 +63,7 @@ class TaskExecutor:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.task_queue = queue.PriorityQueue()
         self.tasks: Dict[str, Task] = {}
-        self.futures: Dict[str, Future] = {}  # Futures créés immédiatement à la soumission
+        self.futures: Dict[str, Future] = {}
         self.running = True
         self.persist_path = persist_path
         self.persist_interval = 60
@@ -99,7 +99,6 @@ class TaskExecutor:
                         task_dict['func'] = None
                         task = Task(**task_dict)
                         self.tasks[task_id] = task
-                        # Créer un future pour cette tâche (même si elle est déjà terminée)
                         self.futures[task_id] = Future()
                         if task.status == TaskStatus.COMPLETED:
                             self.futures[task_id].set_result(task.result)
@@ -151,15 +150,20 @@ class TaskExecutor:
             if to_delete:
                 logger.debug(f"🧹 Nettoyage de {len(to_delete)} anciennes tâches")
 
-    def submit(self, task: Task) -> str:
+    def submit(self, task: Task, priority: Optional[int] = None) -> str:
+        """
+        Soumet une tâche avec une priorité optionnelle.
+        Si priority est fourni, il écrase la priorité de la tâche.
+        """
         with self._lock:
             task.id = task.id or str(uuid.uuid4())
+            if priority is not None:
+                task.priority = priority
             task.created_at = task.created_at or time.time()
             task.status = TaskStatus.PENDING
             if task.kwargs is None:
                 task.kwargs = {}
             self.tasks[task.id] = task
-            # Créer un future immédiatement
             self.futures[task.id] = Future()
             self.task_queue.put((-task.priority, task.id))
             self.metrics['total_submitted'] += 1
@@ -213,7 +217,6 @@ class TaskExecutor:
                             dep_results.append(None)
 
                 all_args = tuple(dep_results) + task.args
-                # Exécuter la tâche dans un thread du pool
                 self.executor.submit(self._execute_task, task, future, *all_args, **task.kwargs)
 
                 set_active_tasks(len(self.futures))
@@ -224,7 +227,6 @@ class TaskExecutor:
                 logger.error(f"Erreur dans worker loop: {e}")
 
     def _execute_task(self, task: Task, future: Future, *args, **kwargs):
-        """Exécute la tâche et complète le future."""
         try:
             if 'progress_callback' in kwargs:
                 kwargs['progress_callback'] = lambda p, m: self._update_progress(task.id, p, m)

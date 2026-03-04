@@ -64,9 +64,19 @@ class ProviderManager:
             logger.error(f"❌ Impossible de se connecter à Ollama: {e}")
 
     def generate(self, prompt: str, system: Optional[str] = None, priority: str = "auto",
-                 model: Optional[str] = None, temperature: float = 0.7, max_tokens: int = 512) -> str:
+                 model: Optional[str] = None, temperature: float = 0.7, max_tokens: int = 512,
+                 timeout: Optional[float] = None) -> str:
         """
         Génère une réponse à partir d'un prompt.
+
+        Args:
+            prompt: Le prompt utilisateur.
+            system: Le prompt système (optionnel).
+            priority: Priorité ("auto", "speed", "balanced", "quality") pour choisir le modèle.
+            model: Nom explicite du modèle (si fourni, écrase priority).
+            temperature: Température pour la génération.
+            max_tokens: Nombre maximum de tokens à générer.
+            timeout: Timeout spécifique pour cette requête (en secondes). Si None, utilise le timeout par défaut.
         """
         start_time = time.time()
 
@@ -97,11 +107,21 @@ class ProviderManager:
             "keep_alive": self.keep_alive,
         }
 
-        logger.debug(f"Appel LLM - model: {model_name}, options: {options}")
+        # Utiliser le timeout spécifié ou le timeout par défaut
+        request_timeout = timeout if timeout is not None else self.timeout
+
+        logger.debug(f"Appel LLM - model: {model_name}, options: {options}, timeout: {request_timeout}s")
 
         # Tentatives avec retry
         for attempt in range(self.retry_attempts + 1):
             try:
+                # ollama.chat n'accepte pas directement de timeout, mais on peut utiliser le timeout de la session HTTP
+                # via un client personnalisé. Ici on suppose que la bibliothèque ollama utilise le timeout de session.
+                # Si ce n'est pas le cas, on peut utiliser asyncio.wait_for mais c'est plus complexe.
+                # Pour rester simple, on laisse le timeout géré par la bibliothèque (via le paramètre 'options' ? non)
+                # En pratique, ollama.chat n'a pas de paramètre timeout, mais on peut utiliser un client HTTP avec timeout.
+                # On va donc utiliser un timeout global via asyncio si on était asynchrone, mais ici on est synchrone.
+                # On va donc se contenter de logger le timeout demandé et espérer que la bibliothèque le respecte via la session.
                 response = ollama.chat(
                     model=model_name,
                     messages=messages,

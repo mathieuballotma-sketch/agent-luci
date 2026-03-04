@@ -1,6 +1,6 @@
 """
 Cortex central - Orchestrateur des agents et de la planification
-Version ultra-optimisée pour latence <3s.
+Version avec gestion des erreurs et des requêtes composées.
 """
 
 import asyncio
@@ -8,9 +8,10 @@ import time
 import json
 import re
 import hashlib
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Callable
 from concurrent.futures import TimeoutError
 import threading
+from collections import defaultdict
 
 from ..providers.manager import ProviderManager
 from ..services.prompt_cache import PromptCache
@@ -20,7 +21,8 @@ from ..core.elasticity import ElasticityEngine
 from ..utils.logger import logger
 from ..utils.metrics import (
     llm_requests_total, llm_request_duration_seconds,
-    planning_duration, plan_cache_hits, plan_cache_misses
+    planning_duration, plan_cache_hits, plan_cache_misses,
+    record_cortex_step
 )
 from ..memory import MemoryService
 from app.agents.base_agent import BaseAgent
@@ -32,12 +34,89 @@ from app.agents.computer_control_agent import ComputerControlAgent
 from app.brain.synapses.event_bus import EventBus
 
 
+class ActionSelector:
+    """
+    Sélecteur de chemin basé sur le principe de moindre action.
+    Maintient pour chaque type de requête une liste de chemins ordonnés
+    par temps de réponse moyen (du plus rapide au plus lent).
+    En cas d'échec d'un chemin, le suivant est essayé.
+    """
+
+    def __init__(self):
+        # Pour chaque type de requête, on stocke les statistiques par chemin
+        self.stats = defaultdict(lambda: defaultdict(lambda: {"sum": 0.0, "count": 0, "failures": 0}))
+        self.paths = {}  # id -> {"func": callable, "description": str}
+
+    def register_path(self, path_id: str, func: Callable, description: str = ""):
+        self.paths[path_id] = {"func": func, "description": description}
+
+    def get_paths_for_query(self, query: str) -> List[Tuple[str, Callable]]:
+        """
+        Retourne la liste des chemins à essayer pour cette requête,
+        ordonnés du plus rapide (meilleure moyenne) au plus lent.
+        Les chemins sans statistiques sont placés en fin de liste (ordre d'enregistrement).
+        """
+        query_type = self._classify_query(query)
+        type_stats = self.stats[query_type]
+
+        # Calculer la moyenne pour chaque chemin qui a des données
+        averages = {}
+        for path_id in self.paths:
+            s = type_stats.get(path_id, {"sum": 0.0, "count": 0})
+            if s["count"] > 0:
+                averages[path_id] = s["sum"] / s["count"]
+            else:
+                averages[path_id] = float('inf')  # pas encore de données
+
+        # Trier les chemins par moyenne croissante
+        sorted_paths = sorted(self.paths.keys(), key=lambda pid: averages[pid])
+
+        # Retourner une liste de tuples (id, fonction)
+        return [(pid, self.paths[pid]["func"]) for pid in sorted_paths]
+
+    def record_success(self, query: str, path_id: str, duration: float):
+        """Enregistre un succès pour ce chemin et ce type de requête."""
+        query_type = self._classify_query(query)
+        s = self.stats[query_type][path_id]
+        s["sum"] += duration
+        s["count"] += 1
+
+    def record_failure(self, query: str, path_id: str):
+        """Enregistre un échec (pour pénaliser le chemin si nécessaire)."""
+        query_type = self._classify_query(query)
+        s = self.stats[query_type][path_id]
+        s["failures"] += 1
+        # Pénalité de 10 secondes pour que ce chemin soit moins prioritaire
+        s["sum"] += 10.0
+        s["count"] += 1
+
+    def _classify_query(self, query: str) -> str:
+        """Classe une requête en type : salutation, simple, action, complexe."""
+        q = query.lower().strip()
+        # Salutations
+        greetings = ["bonjour", "salut", "hello", "coucou", "merci", "au revoir", "bye", "hi"]
+        if q in greetings or any(g in q for g in greetings):
+            return "greeting"
+        # Actions explicites
+        action_keywords = ["ouvre", "lance", "tape", "clique", "capture", "open", "launch", "type", "click"]
+        if any(kw in q for kw in action_keywords):
+            # Si plusieurs actions (présence de "et" ou "puis"), on considère comme complexe
+            if " et " in q or " puis " in q:
+                return "multi_action"
+            return "action"
+        # Questions simples
+        word_count = len(q.split())
+        if word_count < 5:
+            return "simple"
+        return "complex"
+
+
 class FrontalCortex:
     """
     Cortex frontal - Orchestrateur des agents et de la planification.
+    Utilise un sélecteur de chemin pour minimiser le temps de réponse.
     """
 
-    # Actions simples qui peuvent être routées directement sans LLM
     SIMPLE_ACTIONS = {
         "ouvre": ("ComputerControlAgent", "open_application"),
         "open": ("ComputerControlAgent", "open_application"),
@@ -68,12 +147,11 @@ class FrontalCortex:
         self._register_agents()
 
         self.default_system = "Tu es un assistant IA utile, amical et concis."
-        self.plan_timeout = config.get("plan_timeout", 30.0)
+        self.base_plan_timeout = config.get("plan_timeout", 30.0)
         self.max_plan_retries = config.get("max_plan_retries", 1)
         self.enable_memory = config.get("enable_memory", True)
         self.enable_elasticity = config.get("enable_elasticity", True)
 
-        # Mapping des profils vers les noms de modèles réels
         self.model_mapping = {
             "speed": config.get("speed_model", "qwen2.5:3b"),
             "balanced": config.get("balanced_model", "qwen2.5:7b"),
@@ -81,8 +159,11 @@ class FrontalCortex:
             "nano": "qwen2.5:0.5b"
         }
 
+        self.action_selector = ActionSelector()
+        self._register_paths()
+
         self._lock = threading.RLock()
-        logger.info(f"🧠 Cortex ultra-optimisé initialisé avec {len(self.agents)} agents")
+        logger.info(f"🧠 Cortex avec séquence de chemins LLM multiples initialisé avec {len(self.agents)} agents")
 
     def _register_agents(self):
         agents_list = [
@@ -99,57 +180,164 @@ class FrontalCortex:
         for agent in agents_list:
             self.agents[agent.name] = agent
 
-    def _is_simple_query(self, query: str) -> bool:
+    def _register_paths(self):
+        self.action_selector.register_path(
+            "direct_action",
+            self._execute_direct_action,
+            "Exécution directe d'une action simple"
+        )
+        self.action_selector.register_path(
+            "multi_action",
+            self._execute_multi_action,
+            "Exécution séquentielle de plusieurs actions"
+        )
+        self.action_selector.register_path(
+            "cache_response",
+            self._get_cached_response,
+            "Réponse depuis le cache exact"
+        )
+        self.action_selector.register_path(
+            "llm_nano",
+            lambda q: self._call_llm(q, "nano"),
+            "LLM nano (0.5B)"
+        )
+        self.action_selector.register_path(
+            "llm_speed",
+            lambda q: self._call_llm(q, "speed"),
+            "LLM speed (3B)"
+        )
+        self.action_selector.register_path(
+            "llm_balanced",
+            lambda q: self._call_llm(q, "balanced"),
+            "LLM balanced (7B)"
+        )
+        self.action_selector.register_path(
+            "plan_generation",
+            self._generate_and_execute_plan,
+            "Génération et exécution d'un plan"
+        )
+
+    def _execute_direct_action(self, query: str) -> str:
+        """Exécute une action simple détectée par mots-clés."""
+        route = self._route_simple_action(query)
+        if route:
+            agent_name, action = route
+            agent = self.agents.get(agent_name)
+            if agent:
+                result = asyncio.run(agent.execute_tool(action['tool'], action['parameters']))
+                # Si le résultat commence par "❌", c'est un échec fonctionnel
+                if result.startswith("❌"):
+                    raise Exception(f"L'outil a retourné une erreur: {result}")
+                return result
+        raise Exception("Aucune action directe trouvée")
+
+    def _execute_multi_action(self, query: str) -> str:
         """
-        Détermine si une requête est simple (réponse directe sans plan).
-        Inclut les questions générales sans intention d'action.
+        Tente d'exécuter séquentiellement plusieurs actions simples détectées dans la requête.
+        Par exemple : "ouvre note et écris bonjour" -> d'abord open_application, puis type_text.
         """
-        q = query.lower()
-        # 1. Routage direct vers une action évidente
-        for keyword in self.SIMPLE_ACTIONS:
-            if keyword in q:
-                # Si c'est une question sur "comment faire", on ne route pas directement
-                if "comment" in q and keyword in q:
-                    return False
-                return True
+        # Diviser la requête autour de " et " ou " puis "
+        parts = re.split(r"\s+(et|puis)\s+", query, flags=re.IGNORECASE)
+        results = []
+        for part in parts:
+            part = part.strip()
+            if not part or part.lower() in ["et", "puis"]:
+                continue
+            route = self._route_simple_action(part)
+            if not route:
+                # Si une partie n'est pas une action simple, on abandonne cette approche
+                raise Exception(f"Impossible de traiter la sous-action: {part}")
+            agent_name, action = route
+            agent = self.agents.get(agent_name)
+            if not agent:
+                raise Exception(f"Agent {agent_name} introuvable")
+            result = asyncio.run(agent.execute_tool(action['tool'], action['parameters']))
+            if result.startswith("❌"):
+                raise Exception(f"Échec de la sous-action: {result}")
+            results.append(result)
+        if results:
+            return "\n".join(results)
+        raise Exception("Aucune action multiple trouvée")
 
-        # 2. Mots-clés d'action (nécessitent un plan)
-        action_keywords = [
-            "recherche", "trouve", "document", "rappel", "écran", "crée",
-            "fais", "word", "note", "mail", "résumé", "synthèse", "analyse",
-            "compare", "liste", "envoie", "programme", "ajoute", "clique",
-            "tape", "ouvre", "lance", "souris", "déplace", "organise", "arrange"
-        ]
-        if any(kw in q for kw in action_keywords):
-            return False
+    def _get_cached_response(self, query: str) -> str:
+        cached = self.prompt_cache.get(query, system=self.default_system, model="balanced")
+        if cached:
+            return cached
+        raise Exception("Cache miss")
 
-        # 3. Questions générales -> simples
-        question_words = ["comment", "pourquoi", "est-ce que", "quel", "quelle", "quels", "quelles",
-                          "qui", "que", "quoi", "où", "quand", "combien"]
-        if any(q.startswith(w) or f" {w} " in q for w in question_words):
-            return True
+    def _call_llm(self, query: str, model_profile: str) -> str:
+        """Appelle le LLM avec le modèle correspondant au profil (nano, speed, balanced)."""
+        model_name = self.model_mapping.get(model_profile)
+        if not model_name:
+            raise Exception(f"Profil de modèle inconnu: {model_profile}")
+        enriched_query = self._enrich_query(query)
+        # Timeout dynamique basé sur la longueur de la requête
+        word_count = len(query.split())
+        timeout = 5.0 * (1 + word_count / 50)  # max ~15s pour 500 mots
+        timeout = min(timeout, 30.0)
+        response = self.manager.generate(
+            prompt=enriched_query,
+            system=self.default_system,
+            model=model_name,
+            temperature=0.5,
+            max_tokens=256,
+            timeout=timeout
+        )
+        self.prompt_cache.put(query, self.default_system, "balanced", response)
+        if self.enable_memory:
+            self.memory.add_to_working(query, response)
+            self.memory.add_episode(query, response, metadata={"latency": time.time()})
+        return response
 
-        # 4. Requêtes très courtes (< 10 mots) -> simples
-        if len(q.split()) < 10:
-            return True
+    def _generate_and_execute_plan(self, query: str) -> str:
+        plan = self._generate_plan_with_retry(query)
+        if not plan:
+            raise Exception("Plan invalide")
+        self._cache_plan(query, plan)
+        timeout = self._get_dynamic_timeout(query, plan_needed=True)
+        final_response = self._execute_plan(plan, query, timeout=timeout)
+        self.prompt_cache.put(query, self.default_system, "balanced", final_response)
+        if self.enable_memory:
+            self.memory.add_to_working(query, final_response)
+            self.memory.add_episode(query, final_response, metadata={"latency": time.time()})
+        return final_response
 
-        return False
+    def _safe_fallback(self, query: str) -> str:
+        logger.warning("Utilisation du fallback sécurisé")
+        return "Désolé, je n'ai pas pu traiter votre demande. Veuillez réessayer."
+
+    # -----------------------------------------------------------------------
+    # Méthodes de support
+    # -----------------------------------------------------------------------
 
     def _route_simple_action(self, query: str) -> Optional[Tuple[str, Dict]]:
-        """Tente de router une requête simple directement vers un outil sans LLM."""
+        """Extrait une action simple d'une requête."""
         q = query.lower()
         for keyword, (agent_name, tool_name) in self.SIMPLE_ACTIONS.items():
             if keyword in q:
-                # Extraction basique des paramètres
+                # Extraction des paramètres selon l'outil
                 if tool_name == "open_application":
+                    # On prend tout après le mot-clé, en supprimant les guillemets éventuels
                     rest = q.replace(keyword, "").strip()
-                    if rest:
-                        return agent_name, {"tool": tool_name, "parameters": {"app_name": rest}}
+                    # Si le reste commence par "et" ou "puis", c'est qu'il y a une autre action
+                    if rest.startswith(("et", "puis")):
+                        continue  # on ne prend pas cette partie
+                    # Enlever les guillemets si présents
+                    rest = re.sub(r'^["\'](.*)["\']$', r'\1', rest)
+                    return agent_name, {"tool": tool_name, "parameters": {"app_name": rest}}
                 elif tool_name == "type_text":
+                    # Chercher du texte entre guillemets
                     import re
                     match = re.search(r'"([^"]+)"', query)
                     if match:
-                        return agent_name, {"tool": tool_name, "parameters": {"text": match.group(1)}}
+                        text = match.group(1)
+                        # Vérifier si un nom d'application est spécifié avant
+                        app_match = re.search(r'(?:dans|sur)\s+([a-zA-Z]+)', q, re.IGNORECASE)
+                        app_name = app_match.group(1) if app_match else None
+                        params = {"text": text}
+                        if app_name:
+                            params["app_name"] = app_name
+                        return agent_name, {"tool": tool_name, "parameters": params}
                 elif tool_name == "click":
                     match = re.search(r'(\d+)[,\s]+(\d+)', query)
                     if match:
@@ -157,167 +345,27 @@ class FrontalCortex:
                         return agent_name, {"tool": tool_name, "parameters": {"x": x, "y": y}}
                 elif tool_name == "get_screenshot":
                     return agent_name, {"tool": tool_name, "parameters": {}}
-                # Fallback : l'agent devra interpréter
-                return agent_name, {"tool": tool_name, "parameters": {}}
         return None
 
-    def _get_model_for_query(self, query: str, plan_needed: bool = False) -> str:
-        """
-        Choisit le modèle LLM en fonction de la complexité.
-        Pour les réponses directes, on privilégie les modèles rapides.
-        """
-        if plan_needed:
-            if len(query.split()) < 20:
-                return self.model_mapping.get("speed", "qwen2.5:3b")
-            else:
-                return self.model_mapping.get("balanced", "qwen2.5:7b")
-        else:
-            word_count = len(query.split())
-            if word_count < 10:
-                # Ultra court -> nano (0.5B)
-                return self.model_mapping.get("nano", "qwen2.5:0.5b")
-            elif word_count < 30:
-                # Court -> speed (3B)
-                return self.model_mapping.get("speed", "qwen2.5:3b")
-            else:
-                # Plus long -> balanced (7B)
-                return self.model_mapping.get("balanced", "qwen2.5:7b")
+    def _get_dynamic_timeout(self, query: str, plan_needed: bool) -> float:
+        base = self.base_plan_timeout if plan_needed else 5.0
+        word_count = len(query.split())
+        estimated = base * (1 + word_count / 100)
+        return min(estimated, self.base_plan_timeout * 2)
+
+    def _enrich_query(self, query: str) -> str:
+        if self.enable_memory:
+            working_context = self.memory.get_working_context(n=3)
+            if working_context:
+                return f"Contexte récent:\n{working_context}\n\n{query}"
+        return query
 
     def _build_agents_description(self) -> str:
-        """Version ultra‑courte : juste le nom de l'agent et la liste de ses outils."""
         desc = []
         for name, agent in self.agents.items():
             tool_names = ", ".join([t.name for t in agent.get_tools()])
             desc.append(f"- {name}: {tool_names}")
         return "\n".join(desc)
-
-    def think(self, query: str, system_prompt: Optional[str] = None,
-              allow_web_search: bool = True) -> Tuple[str, float]:
-        start = time.time()
-        logger.info(f"🧠 think() - Requête: {query[:50]}...")
-        steps = {}
-
-        # 0. Routage direct pour les actions simples
-        t0 = time.time()
-        route = self._route_simple_action(query)
-        steps['routing'] = time.time() - t0
-        if route:
-            agent_name, action = route
-            logger.info(f"⚡ Routage direct vers {agent_name}.{action['tool']}")
-            try:
-                agent = self.agents.get(agent_name)
-                if agent:
-                    result = asyncio.run(agent.execute_tool(action['tool'], action['parameters']))
-                    total = time.time() - start
-                    logger.info(f"⏱️ Action directe exécutée en {total:.3f}s")
-                    return result, total
-            except Exception as e:
-                logger.error(f"Échec routage direct: {e}")
-
-        # 1. Cache exact (uniquement pour les requêtes simples)
-        t0 = time.time()
-        cached = None
-        if self._is_simple_query(query):
-            cached = self.prompt_cache.get(query, system=self.default_system, model="balanced")
-        steps['cache_exact'] = time.time() - t0
-        if cached:
-            logger.info(f"🎯 Réponse trouvée en cache ({steps['cache_exact']:.3f}s)")
-            return cached, time.time() - start
-
-        # 2. Enrichissement mémoire (seulement si nécessaire et pas simple)
-        t0 = time.time()
-        enriched_query = query
-        if self.enable_memory and not self._is_simple_query(query):
-            working_context = self.memory.get_working_context(n=3)
-            if working_context:
-                enriched_query = f"Contexte récent:\n{working_context}\n\n{query}"
-        steps['enrichissement'] = time.time() - t0
-
-        # 3. Requête simple → réponse directe avec modèle rapide et tokens réduits
-        t0 = time.time()
-        if self._is_simple_query(query):
-            steps['simple_check'] = time.time() - t0
-            logger.info("⚡ Requête simple, réponse directe")
-            model = self._get_model_for_query(query, plan_needed=False)
-            with llm_request_duration_seconds.labels(model=model).time():
-                response = self.manager.generate(
-                    prompt=enriched_query,
-                    system=self.default_system,
-                    model=model,
-                    temperature=0.5,
-                    max_tokens=256  # réduit pour accélérer
-                )
-            self.prompt_cache.put(query, self.default_system, "balanced", response)
-            if self.enable_memory:
-                self.memory.add_to_working(query, response)
-                self.memory.add_episode(query, response, metadata={"latency": time.time() - start})
-            total = time.time() - start
-            logger.info(f"⏱️ Timings: {steps} total={total:.3f}s")
-            return response, total
-        steps['simple_check'] = time.time() - t0
-
-        # 4. Cache de plan (vectoriel) - seuil abaissé à 0.75
-        t0 = time.time()
-        cached_plan = self._get_cached_plan(enriched_query)
-        steps['cache_plan'] = time.time() - t0
-        if cached_plan:
-            logger.info("📋 Plan trouvé en cache")
-            plan_cache_hits.labels(cache_type="vector").inc()
-            try:
-                final_response = self._execute_plan(cached_plan, enriched_query)
-                self.prompt_cache.put(query, self.default_system, "balanced", final_response)
-                if self.enable_memory:
-                    self.memory.add_to_working(query, final_response)
-                    self.memory.add_episode(query, final_response, metadata={"latency": time.time() - start})
-                total = time.time() - start
-                logger.info(f"⏱️ Timings: {steps} total={total:.3f}s")
-                return final_response, total
-            except Exception as e:
-                logger.error(f"Échec d'exécution du plan caché: {e}")
-
-        plan_cache_misses.labels(cache_type="vector").inc()
-
-        # 5. Génération du plan (modèle adapté)
-        t0 = time.time()
-        plan = self._generate_plan_with_retry(enriched_query)
-        steps['gen_plan'] = time.time() - t0
-
-        # 6. Exécution du plan ou réponse directe
-        t0 = time.time()
-        if plan and len(plan) > 0:
-            self._cache_plan(query, plan)
-            try:
-                final_response = self._execute_plan(plan, enriched_query, timeout=self.plan_timeout)
-                steps['exec_plan'] = time.time() - t0
-            except TimeoutError:
-                logger.error(f"Timeout exécution plan ({self.plan_timeout}s)")
-                final_response = "Désolé, le traitement a pris trop de temps. Veuillez reformuler."
-                steps['exec_plan'] = time.time() - t0
-            except Exception as e:
-                logger.error(f"Erreur exécution plan: {e}")
-                final_response = f"Une erreur est survenue: {str(e)}"
-                steps['exec_plan'] = time.time() - t0
-        else:
-            logger.info("⚡ Pas de plan, réponse directe avec modèle rapide")
-            model = self._get_model_for_query(query, plan_needed=False)
-            with llm_request_duration_seconds.labels(model=model).time():
-                response = self.manager.generate(
-                    prompt=enriched_query,
-                    system=self.default_system,
-                    model=model,
-                    max_tokens=256
-                )
-            final_response = response
-            steps['direct_response'] = time.time() - t0
-
-        self.prompt_cache.put(query, self.default_system, "balanced", final_response)
-        if self.enable_memory:
-            self.memory.add_to_working(query, final_response)
-            self.memory.add_episode(query, final_response, metadata={"latency": time.time() - start})
-
-        total = time.time() - start
-        logger.info(f"⏱️ Timings: {steps} total={total:.3f}s")
-        return final_response, total
 
     def _get_cached_plan(self, query: str) -> Optional[List[Dict]]:
         try:
@@ -348,15 +396,10 @@ class FrontalCortex:
 
     def _generate_plan(self, query: str) -> Optional[List[Dict]]:
         agents_desc = self._build_agents_description()
-        prompt = f"""Planifie les actions pour: "{query}"
-Agents disponibles:
-{agents_desc}
-
-Format JSON attendu : une liste d'étapes. Chaque étape a : id, agent, tool, parameters, description.
-Exemples :
-- [{{"id":"1","agent":"ComputerControlAgent","tool":"open_application","parameters":{{"app_name":"Notes"}},"description":"Ouvre Notes"}}]
-- [{{"id":"1","agent":"ComputerControlAgent","tool":"type_text","parameters":{{"text":"Bonjour","app_name":"Notes"}},"description":"Tape le texte dans Notes"}}]
-
+        prompt = f"""Planifie: "{query}"
+Agents: {agents_desc}
+Format JSON: [{{"id":"1","agent":"X","tool":"Y","parameters":{{}},"description":"..."}}]
+Ex: [{{"id":"1","agent":"ComputerControlAgent","tool":"open_application","parameters":{{"app_name":"Notes"}},"description":"Ouvre Notes"}}]
 Réponds uniquement avec le JSON, sinon [].
 """
         try:
@@ -500,6 +543,41 @@ Réponds uniquement avec le JSON, sinon [].
         except Exception as e:
             logger.error(f"Erreur synthèse: {e}")
             return "\n\n".join(results)
+
+    # -----------------------------------------------------------------------
+    # Interface publique (think)
+    # -----------------------------------------------------------------------
+
+    def think(self, query: str, system_prompt: Optional[str] = None,
+              allow_web_search: bool = True) -> Tuple[str, float]:
+        start = time.time()
+        logger.info(f"🧠 think() - Requête: {query[:50]}...")
+
+        # Obtenir la liste ordonnée des chemins à essayer
+        paths = self.action_selector.get_paths_for_query(query)
+        logger.info(f"⚡ Chemins possibles: {[p[0] for p in paths]}")
+
+        last_error = None
+        for path_id, path_func in paths:
+            try:
+                response = path_func(query)
+                duration = time.time() - start
+                self.action_selector.record_success(query, path_id, duration)
+                record_cortex_step(path_id, duration)
+                logger.info(f"✅ Chemin {path_id} réussi en {duration:.3f}s")
+                return response, duration
+            except Exception as e:
+                logger.warning(f"Chemin {path_id} échoué: {e}")
+                self.action_selector.record_failure(query, path_id)
+                last_error = e
+                # Continuer avec le chemin suivant
+
+        # Si tous les chemins ont échoué, utiliser le fallback sécurisé
+        logger.error(f"Tous les chemins ont échoué: {last_error}")
+        response = self._safe_fallback(query)
+        duration = time.time() - start
+        record_cortex_step("safe_fallback", duration)
+        return response, duration
 
     def stop(self):
         self.executor.shutdown()

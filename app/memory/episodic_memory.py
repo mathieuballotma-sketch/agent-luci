@@ -2,7 +2,7 @@
 Mémoire épisodique : stocke les interactions passées dans une base vectorielle.
 Permet de retrouver des souvenirs similaires pour enrichir le contexte.
 Utilise ChromaDB avec une politique d'éviction LRU (basée sur timestamp).
-Version avec gestion optionnelle de sentence-transformers.
+Version avec gestion optionnelle de sentence-transformers et cache LRU.
 """
 
 import time
@@ -10,6 +10,7 @@ import hashlib
 import threading
 from typing import List, Dict, Any, Optional
 from pathlib import Path
+from collections import OrderedDict
 
 import chromadb
 import numpy as np
@@ -67,13 +68,17 @@ class EpisodicMemory:
 
         # Initialisation ChromaDB
         self.client = chromadb.PersistentClient(path=str(self.persist_directory))
-        # On utilise un embedding function factice pour Chroma (car on gère les embeddings nous-mêmes)
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"}
         )
 
         self._lock = threading.RLock()
+
+        # Cache LRU pour les requêtes récentes
+        self.query_cache = OrderedDict()
+        self.cache_max_size = 20
+
         logger.info(f"🧠 Mémoire épisodique initialisée avec {self.collection.count()} souvenirs (embedder: {'réel' if SENTENCE_TRANSFORMERS_AVAILABLE else 'factice'})")
 
     def add(self, query: str, response: str, metadata: Optional[Dict] = None):
@@ -94,9 +99,9 @@ class EpisodicMemory:
                 # Métadonnées par défaut
                 meta = metadata or {}
                 meta['timestamp'] = time.time()
-                meta['query'] = query  # Pour faciliter la recherche
+                meta['query'] = query
 
-                # Calcul de l'embedding (si embedder réel, sinon vecteur nul)
+                # Calcul de l'embedding
                 embedding = self.embedder.encode(query).tolist()
 
                 # Ajouter à Chroma
@@ -108,7 +113,6 @@ class EpisodicMemory:
                 )
                 logger.debug(f"Souvenir ajouté: {query[:50]}...")
 
-        # Lancer dans un thread pour ne pas bloquer
         threading.Thread(target=_add, daemon=True).start()
 
     def search(self, query: str, n_results: int = 3, min_similarity: float = 0.7) -> List[Dict]:
@@ -123,6 +127,15 @@ class EpisodicMemory:
 
         if self.collection.count() == 0:
             return []
+
+        # Vérifier le cache
+        cache_key = hashlib.md5(query.encode()).hexdigest()
+        with self._lock:
+            if cache_key in self.query_cache:
+                logger.debug("Résultat mémoire trouvé en cache")
+                # Remettre l'élément à la fin (LRU)
+                self.query_cache.move_to_end(cache_key)
+                return self.query_cache[cache_key]
 
         try:
             # Encoder la requête
@@ -141,7 +154,7 @@ class EpisodicMemory:
                 for i, doc in enumerate(results['documents'][0]):
                     metadata = results['metadatas'][0][i]
                     distance = results['distances'][0][i]
-                    similarity = 1 - distance  # cosine distance -> similarity
+                    similarity = 1 - distance
 
                     if similarity >= min_similarity:
                         memories.append({
@@ -150,6 +163,13 @@ class EpisodicMemory:
                             'metadata': metadata,
                             'similarity': similarity
                         })
+
+            # Mettre en cache
+            with self._lock:
+                self.query_cache[cache_key] = memories
+                self.query_cache.move_to_end(cache_key)
+                if len(self.query_cache) > self.cache_max_size:
+                    self.query_cache.popitem(last=False)
 
             return memories
 
@@ -160,12 +180,10 @@ class EpisodicMemory:
     def _evict_oldest(self):
         """Supprime le souvenir le plus ancien (par timestamp)"""
         try:
-            # Récupérer tous les métadonnées avec timestamps
             all_data = self.collection.get(include=["metadatas"])
             if not all_data['metadatas']:
                 return
 
-            # Trouver l'ID du plus ancien
             oldest_id = None
             oldest_ts = float('inf')
             for i, meta in enumerate(all_data['metadatas']):

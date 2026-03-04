@@ -136,11 +136,19 @@ working_memory_size = Gauge(
     'Nombre d éléments dans la mémoire de travail'
 )
 
-# Métriques du stratège (ajoutée)
+# Métriques du stratège
 strategist_suggestions_total = Counter(
     'strategist_suggestions_total',
     'Nombre total de suggestions générées par le stratège',
     ['category']
+)
+
+# Métriques des étapes du cortex
+cortex_step_duration = Histogram(
+    'cortex_step_duration_seconds',
+    'Durée de chaque étape du cortex',
+    ['step'],
+    buckets=(0.001, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0)
 )
 
 # Thread pour le serveur Prometheus
@@ -223,7 +231,11 @@ def set_working_memory_size(size: int):
     working_memory_size.set(size)
 
 
-# Optionnel : fonction utilitaire pour incrémenter la métrique du stratège
 def record_strategist_suggestion(category: str = "other"):
     """Incrémente le compteur de suggestions du stratège."""
     strategist_suggestions_total.labels(category=category).inc()
+
+
+def record_cortex_step(step: str, duration: float):
+    """Enregistre la durée d'une étape du cortex."""
+    cortex_step_duration.labels(step=step).observe(duration)
