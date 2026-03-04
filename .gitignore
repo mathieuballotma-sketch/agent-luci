@@ -19,3 +19,14 @@ config.yaml
 *.db
 .DS_Store
 *.log
+chroma_data/
+data/
+Lucid_Docs/
+backup_old/
+short_term_memory.json
+*.json
+chroma_data/
+data/
+Lucid_Docs/
+backup_old/
+short_term_memory.json
