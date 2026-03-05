@@ -1,7 +1,7 @@
 """
 Moteur principal de l'application.
 Coordonne le cortex, les services, la mémoire et les agents.
-Intègre désormais l'agent Cyber.
+Intègre désormais l'agent Cyber et le réseau P2P simplifié.
 """
 
 import asyncio
@@ -24,6 +24,7 @@ from app.actions.writer import WriterAgent
 from app.actions.router import ActionRouter
 from app.core.executor import TaskExecutor
 from app.utils.circuit_breaker import CircuitBreaker
+from app.utils.crypto import CryptoManager
 from ..utils.logger import logger
 from ..utils.metrics import start_metrics_server, strategist_suggestions_total
 from ..utils.memory_monitor import monitor_memory
@@ -32,6 +33,7 @@ from ..core.elasticity import ElasticityEngine
 from ..agents.profile_agent import ProfileAgent
 from ..agents.strategist_agent import StrategistAgent
 from ..agents.cyber_agent import CyberAgent
+from ..p2p.node import P2PNode
 
 
 class LucidEngine:
@@ -50,6 +52,9 @@ class LucidEngine:
         self.executor = TaskExecutor(max_workers=3, persist_path=data_dir / "tasks.pkl")
         self.prompt_cache = PromptCache(cache_dir=data_dir / "cache", max_size=10000)
         self.ollama_circuit = CircuitBreaker("ollama", failure_threshold=3, recovery_timeout=30)
+
+        # Chiffrement
+        self.crypto = CryptoManager()
 
         # Mémoire
         episodic = EpisodicMemory(
@@ -132,13 +137,27 @@ class LucidEngine:
             config=asdict(config),
             memory_service=self.memory
         )
-        # On connecte l'event_bus aux agents (pour la publication d'erreurs)
+        # Connecter l'event_bus aux agents
         for agent in self.cortex.agents.values():
             agent.event_bus = self.event_bus
+
         # Souscrire aux suggestions
         self.event_bus.subscribe("strategist.suggestion", self._handle_suggestion)
 
-        logger.info("✅ Moteur Lucide initialisé avec mémoire, élasticité, profil, scheduler, stratège et cyber")
+        # Réseau P2P
+        if hasattr(config, 'p2p') and config.p2p.enabled:
+            self.p2p_node = P2PNode(
+                config=asdict(config.p2p),
+                crypto=self.crypto,
+                event_bus=self.event_bus
+            )
+            self.p2p_node.run_in_thread()
+            # Connecter l'agent cyber au P2P pour diffuser les menaces
+            self.event_bus.subscribe("cyber.threat", self._p2p_broadcast_threat)
+        else:
+            self.p2p_node = None
+
+        logger.info("✅ Moteur Lucide initialisé avec mémoire, élasticité, profil, scheduler, stratège, cyber et P2P")
 
     def _init_llm(self):
         models_config = {}
@@ -223,6 +242,11 @@ class LucidEngine:
         except Exception as e:
             logger.error(f"❌ Erreur exécution programmée: {e}")
 
+    async def _p2p_broadcast_threat(self, data, event_id, source):
+        """Relaye une menace de l'agent cyber vers le réseau P2P."""
+        if self.p2p_node:
+            await self.p2p_node.broadcast_threat(data)
+
     def stop(self):
         self.executor.shutdown()
         self.cortex.stop()
@@ -233,4 +257,6 @@ class LucidEngine:
             self.scheduler.stop()
         if hasattr(self, 'cyber_agent'):
             self.cyber_agent.stop()
+        if hasattr(self, 'p2p_node'):
+            asyncio.run(self.p2p_node.stop())
         logger.info("Moteur arrêté.")
