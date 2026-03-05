@@ -1,0 +1,106 @@
+# config.dev.yaml - Configuration pour le développement
+app:
+  name: "Agent Lucide (Dev)"
+  version: "4.0-dev"
+  data_dir: "./data_dev"          # données séparées de la production
+  docs_dir: "./Lucid_Docs_dev"
+  logs_dir: "./logs_dev"
+
+llm:
+  host: "http://localhost:11434"
+  default_model: "qwen2.5:7b"
+  timeout: 60
+  retry_attempts: 2
+  retry_delay: 1.0
+  keep_alive: -1
+  models:
+    speed:
+      name: "qwen2.5:3b"
+      max_tokens: 1024
+      temperature: 0.7
+    balanced:
+      name: "qwen2.5:7b"
+      max_tokens: 2048
+      temperature: 0.6
+    quality:
+      name: "qwen2.5:14b"
+      max_tokens: 4096
+      temperature: 0.5
+    sentinel:
+      name: "qwen2.5:0.5b"
+      max_tokens: 512
+      temperature: 0.1
+
+audio:
+  model_size: "small"
+  device: "cpu"
+  compute_type: "int8"
+  sample_rate: 16000
+  language: "fr"
+  beam_size: 5
+  temp_dir: "./data_dev/temp"
+
+vision:
+  tesseract_cmd: "/opt/homebrew/bin/tesseract"
+  crop_top: 100
+  crop_bottom: 80
+  max_chars: 3000
+  interval: 10
+
+rag:
+  chroma_path: "./data_dev/chroma"
+  embedding_model: "all-MiniLM-L6-v2"
+  chunk_size: 500
+  chunk_overlap: 50
+  max_sources: 5
+  persist_directory: "./data_dev/chroma"
+  collection_name: "documents"
+
+actions:
+  notes_default_account: true
+  reminders_default_list: true
+  word_output_dir: "./Lucid_Docs_dev"
+  allowed_apps: ["Notes", "Rappels", "Mail"]
+
+ui:
+  width: 480
+  height: 630
+  position_x: 100
+  position_y: 100
+  alpha: 0.95
+  font_family: "SF Pro Display"
+  font_size: 13
+  colors:
+    accent: "#007aff"
+    success: "#30d158"
+    warning: "#ff9f0a"
+    error: "#ff453a"
+    background_primary: "#1c1c1e"
+    background_secondary: "#2c2c2e"
+    background_input: "#3a3a3c"
+
+api_keys:
+  news_api_key: ""
+
+memory:
+  max_episodic: 1000        # limité pour le développement
+  working_capacity: 10
+  auto_consolidate: false
+  consolidation_interval: 3600
+
+metrics:
+  enabled: false
+  port: 8001
+  memory_interval: 60
+
+elasticity:
+  base_workers: 3
+  monitor_interval: 2
+  speed_model: "qwen2.5:3b"
+  balanced_model: "qwen2.5:7b"
+  quality_model: "qwen2.5:14b"
+  sentinel_model: "qwen2.5:0.5b"
+
+telegram:
+  bot_token: ""             # désactivé en développement
+  webhook_base: ""

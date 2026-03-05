@@ -1,6 +1,6 @@
 """
 Cortex central - Orchestrateur des agents et de la planification
-Version avec gestion des erreurs et des requêtes composées.
+Version avec prédiction asynchrone (NanoPredictor) pour anticiper les actions.
 """
 
 import asyncio
@@ -8,9 +8,9 @@ import time
 import json
 import re
 import hashlib
+import threading
 from typing import List, Optional, Tuple, Dict, Any, Callable
 from concurrent.futures import TimeoutError
-import threading
 from collections import defaultdict
 
 from ..providers.manager import ProviderManager
@@ -34,6 +34,100 @@ from app.agents.computer_control_agent import ComputerControlAgent
 from app.brain.synapses.event_bus import EventBus
 
 
+class NanoPredictor:
+    """
+    Prédicteur asynchrone qui analyse le texte tapé en temps réel et prépare des actions potentielles.
+    Utilise le modèle nano (0.5B) pour inférer l'intention.
+    """
+
+    def __init__(self, manager: ProviderManager, agents: Dict[str, BaseAgent]):
+        self.manager = manager
+        self.agents = agents
+        self.current_text = ""
+        self.last_prediction = None      # (action_plan, timestamp)
+        self.last_update = 0
+        self._lock = threading.RLock()
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        logger.info("🧠 NanoPredictor démarré")
+
+    def update_partial_input(self, text: str):
+        """Appelé par le HUD à chaque modification du texte."""
+        with self._lock:
+            self.current_text = text
+
+    def get_prediction(self) -> Optional[Dict]:
+        """Retourne la dernière prédiction si elle est encore valide (moins de 5 secondes)."""
+        with self._lock:
+            if self.last_prediction and time.time() - self.last_prediction[1] < 5.0:
+                return self.last_prediction[0]
+        return None
+
+    def _run(self):
+        """Boucle de prédiction : toutes les 1s, si le texte a changé, lance une inférence."""
+        last_text = ""
+        while self._running:
+            time.sleep(1.0)
+            with self._lock:
+                text = self.current_text
+            if text and text != last_text and len(text) > 3:
+                last_text = text
+                self._predict(text)
+
+    def _predict(self, text: str):
+        """Appelle le LLM nano pour interpréter le texte partiel et générer une action candidate."""
+        # Construction du prompt (similaire au semantic parsing)
+        tools_desc = []
+        for agent_name, agent in self.agents.items():
+            for tool in agent.get_tools():
+                # On ne donne que le nom et une description courte pour éviter de surcharger
+                tools_desc.append(f"- {agent_name}.{tool.name}: {tool.description[:100]}")
+        tools_str = "\n".join(tools_desc)
+
+        prompt = f"""
+Tu es un assistant qui prédit l'action que l'utilisateur est en train de décrire.
+Voici les outils disponibles :
+{tools_str}
+
+Le début de la demande : "{text}"
+
+Si tu penses pouvoir compléter cette demande en une ou plusieurs actions, retourne une liste JSON d'actions.
+Chaque action a : "agent", "tool", "parameters" (dict), "description" (optionnelle).
+Si tu n'as pas assez d'informations, retourne [].
+Exemple : [{{"agent": "ComputerControlAgent", "tool": "open_application", "parameters": {{"app_name": "Notes"}}, "description": "Ouvre Notes"}}]
+Réponds uniquement avec le JSON.
+"""
+        try:
+            response = self.manager.generate(
+                prompt=prompt,
+                system="",
+                model="nano",
+                temperature=0.1,
+                max_tokens=256,
+                timeout=3.0
+            )
+            cleaned = response.strip()
+            try:
+                plan = json.loads(cleaned)
+            except json.JSONDecodeError:
+                match = re.search(r'(\[.*\])', cleaned, re.DOTALL)
+                if match:
+                    plan = json.loads(match.group(1))
+                else:
+                    plan = []
+            with self._lock:
+                self.last_prediction = (plan, time.time())
+            logger.debug(f"NanoPredictor: prédiction pour '{text[:30]}...' → {plan}")
+        except Exception as e:
+            logger.error(f"Erreur dans NanoPredictor: {e}")
+
+    def stop(self):
+        self._running = False
+        if self._thread.is_alive():
+            self._thread.join(timeout=1)
+
+
 class ActionSelector:
     """
     Sélecteur de chemin basé sur le principe de moindre action.
@@ -43,78 +137,53 @@ class ActionSelector:
     """
 
     def __init__(self):
-        # Pour chaque type de requête, on stocke les statistiques par chemin
         self.stats = defaultdict(lambda: defaultdict(lambda: {"sum": 0.0, "count": 0, "failures": 0}))
-        self.paths = {}  # id -> {"func": callable, "description": str}
+        self.paths = {}
 
     def register_path(self, path_id: str, func: Callable, description: str = ""):
         self.paths[path_id] = {"func": func, "description": description}
 
     def get_paths_for_query(self, query: str) -> List[Tuple[str, Callable]]:
-        """
-        Retourne la liste des chemins à essayer pour cette requête,
-        ordonnés du plus rapide (meilleure moyenne) au plus lent.
-        Les chemins sans statistiques sont placés en fin de liste (ordre d'enregistrement).
-        """
         query_type = self._classify_query(query)
         type_stats = self.stats[query_type]
 
-        # Calculer la moyenne pour chaque chemin qui a des données
         averages = {}
         for path_id in self.paths:
             s = type_stats.get(path_id, {"sum": 0.0, "count": 0})
-            if s["count"] > 0:
-                averages[path_id] = s["sum"] / s["count"]
-            else:
-                averages[path_id] = float('inf')  # pas encore de données
+            averages[path_id] = s["sum"] / s["count"] if s["count"] > 0 else float('inf')
 
-        # Trier les chemins par moyenne croissante
         sorted_paths = sorted(self.paths.keys(), key=lambda pid: averages[pid])
-
-        # Retourner une liste de tuples (id, fonction)
         return [(pid, self.paths[pid]["func"]) for pid in sorted_paths]
 
     def record_success(self, query: str, path_id: str, duration: float):
-        """Enregistre un succès pour ce chemin et ce type de requête."""
         query_type = self._classify_query(query)
         s = self.stats[query_type][path_id]
         s["sum"] += duration
         s["count"] += 1
 
     def record_failure(self, query: str, path_id: str):
-        """Enregistre un échec (pour pénaliser le chemin si nécessaire)."""
         query_type = self._classify_query(query)
         s = self.stats[query_type][path_id]
         s["failures"] += 1
-        # Pénalité de 10 secondes pour que ce chemin soit moins prioritaire
         s["sum"] += 10.0
         s["count"] += 1
 
     def _classify_query(self, query: str) -> str:
-        """Classe une requête en type : salutation, simple, action, complexe."""
         q = query.lower().strip()
-        # Salutations
         greetings = ["bonjour", "salut", "hello", "coucou", "merci", "au revoir", "bye", "hi"]
         if q in greetings or any(g in q for g in greetings):
             return "greeting"
-        # Actions explicites
-        action_keywords = ["ouvre", "lance", "tape", "clique", "capture", "open", "launch", "type", "click"]
+        action_keywords = ["ouvre", "lance", "tape", "clique", "capture", "open", "launch", "type", "click", "écris", "ecris"]
         if any(kw in q for kw in action_keywords):
-            # Si plusieurs actions (présence de "et" ou "puis"), on considère comme complexe
             if " et " in q or " puis " in q:
                 return "multi_action"
             return "action"
-        # Questions simples
-        word_count = len(q.split())
-        if word_count < 5:
-            return "simple"
-        return "complex"
+        return "simple" if len(q.split()) < 5 else "complex"
 
 
 class FrontalCortex:
     """
     Cortex frontal - Orchestrateur des agents et de la planification.
-    Utilise un sélecteur de chemin pour minimiser le temps de réponse.
     """
 
     SIMPLE_ACTIONS = {
@@ -122,11 +191,26 @@ class FrontalCortex:
         "open": ("ComputerControlAgent", "open_application"),
         "lance": ("ComputerControlAgent", "open_application"),
         "tape": ("ComputerControlAgent", "type_text"),
+        "écris": ("ComputerControlAgent", "type_text"),
+        "ecris": ("ComputerControlAgent", "type_text"),
         "type": ("ComputerControlAgent", "type_text"),
         "clique": ("ComputerControlAgent", "click"),
         "click": ("ComputerControlAgent", "click"),
         "capture": ("ComputerControlAgent", "get_screenshot"),
         "screenshot": ("ComputerControlAgent", "get_screenshot"),
+    }
+
+    APP_ALIASES = {
+        "note": "Notes",
+        "notes": "Notes",
+        "calculatrice": "Calculator",
+        "calculette": "Calculator",
+        "safari": "Safari",
+        "mail": "Mail",
+        "calendrier": "Calendar",
+        "rappels": "Reminders",
+        "reminders": "Reminders",
+        "calendar": "Calendar",
     }
 
     def __init__(self, manager: ProviderManager, bus, event_bus: EventBus,
@@ -159,11 +243,14 @@ class FrontalCortex:
             "nano": "qwen2.5:0.5b"
         }
 
+        # Prédicteur asynchrone
+        self.predictor = NanoPredictor(manager, self.agents)
+
         self.action_selector = ActionSelector()
         self._register_paths()
 
         self._lock = threading.RLock()
-        logger.info(f"🧠 Cortex avec séquence de chemins LLM multiples initialisé avec {len(self.agents)} agents")
+        logger.info(f"🧠 Cortex avec prédicteur initialisé avec {len(self.agents)} agents")
 
     def _register_agents(self):
         agents_list = [
@@ -182,14 +269,24 @@ class FrontalCortex:
 
     def _register_paths(self):
         self.action_selector.register_path(
+            "prediction_cache",
+            self._execute_prediction_cache,
+            "Action anticipée par le prédicteur"
+        )
+        self.action_selector.register_path(
             "direct_action",
             self._execute_direct_action,
-            "Exécution directe d'une action simple"
+            "Exécution directe d'une action simple (mots-clés)"
         )
         self.action_selector.register_path(
             "multi_action",
             self._execute_multi_action,
             "Exécution séquentielle de plusieurs actions"
+        )
+        self.action_selector.register_path(
+            "semantic_parsing",
+            self._execute_semantic_parsing,
+            "Interprétation sémantique via LLM nano"
         )
         self.action_selector.register_path(
             "cache_response",
@@ -199,17 +296,17 @@ class FrontalCortex:
         self.action_selector.register_path(
             "llm_nano",
             lambda q: self._call_llm(q, "nano"),
-            "LLM nano (0.5B)"
+            "LLM nano (0.5B) - réponse directe"
         )
         self.action_selector.register_path(
             "llm_speed",
             lambda q: self._call_llm(q, "speed"),
-            "LLM speed (3B)"
+            "LLM speed (3B) - réponse directe"
         )
         self.action_selector.register_path(
             "llm_balanced",
             lambda q: self._call_llm(q, "balanced"),
-            "LLM balanced (7B)"
+            "LLM balanced (7B) - réponse directe"
         )
         self.action_selector.register_path(
             "plan_generation",
@@ -217,26 +314,40 @@ class FrontalCortex:
             "Génération et exécution d'un plan"
         )
 
+    def _execute_prediction_cache(self, query: str) -> str:
+        """Utilise la prédiction anticipée si elle correspond à la requête finale."""
+        pred = self.predictor.get_prediction()
+        if not pred:
+            raise Exception("Aucune prédiction disponible")
+        # On pourrait vérifier que la requête finale correspond au début de la prédiction,
+        # mais ici on fait confiance au prédicteur.
+        results = []
+        for act in pred:
+            agent_name = act.get("agent")
+            tool_name = act.get("tool")
+            params = act.get("parameters", {})
+            agent = self.agents.get(agent_name)
+            if not agent:
+                raise Exception(f"Agent {agent_name} inconnu")
+            result = asyncio.run(agent.execute_tool(tool_name, params))
+            if result.startswith("❌"):
+                raise Exception(f"Échec de l'action {tool_name}: {result}")
+            results.append(result)
+        return "\n".join(results)
+
     def _execute_direct_action(self, query: str) -> str:
-        """Exécute une action simple détectée par mots-clés."""
         route = self._route_simple_action(query)
         if route:
             agent_name, action = route
             agent = self.agents.get(agent_name)
             if agent:
                 result = asyncio.run(agent.execute_tool(action['tool'], action['parameters']))
-                # Si le résultat commence par "❌", c'est un échec fonctionnel
                 if result.startswith("❌"):
                     raise Exception(f"L'outil a retourné une erreur: {result}")
                 return result
         raise Exception("Aucune action directe trouvée")
 
     def _execute_multi_action(self, query: str) -> str:
-        """
-        Tente d'exécuter séquentiellement plusieurs actions simples détectées dans la requête.
-        Par exemple : "ouvre note et écris bonjour" -> d'abord open_application, puis type_text.
-        """
-        # Diviser la requête autour de " et " ou " puis "
         parts = re.split(r"\s+(et|puis)\s+", query, flags=re.IGNORECASE)
         results = []
         for part in parts:
@@ -245,7 +356,6 @@ class FrontalCortex:
                 continue
             route = self._route_simple_action(part)
             if not route:
-                # Si une partie n'est pas une action simple, on abandonne cette approche
                 raise Exception(f"Impossible de traiter la sous-action: {part}")
             agent_name, action = route
             agent = self.agents.get(agent_name)
@@ -259,6 +369,79 @@ class FrontalCortex:
             return "\n".join(results)
         raise Exception("Aucune action multiple trouvée")
 
+    def _execute_semantic_parsing(self, query: str) -> str:
+        """Interprète la requête avec le LLM nano et exécute les actions."""
+        # Construction du prompt
+        tools_desc = []
+        for agent_name, agent in self.agents.items():
+            for tool in agent.get_tools():
+                tools_desc.append(f"- {agent_name}.{tool.name}: {tool.description}")
+        tools_str = "\n".join(tools_desc)
+
+        prompt = f"""
+Tu es un assistant qui traduit des demandes utilisateur en actions exécutables.
+Voici les outils disponibles :
+{tools_str}
+
+La demande : "{query}"
+
+Génère une liste d'actions au format JSON. Chaque action a :
+- "agent": nom de l'agent
+- "tool": nom de l'outil
+- "parameters": dictionnaire des paramètres
+- "description": courte description (optionnelle)
+
+Exemple pour "ouvre notes et écris bonjour" :
+[
+  {{"agent": "ComputerControlAgent", "tool": "open_application", "parameters": {{"app_name": "Notes"}}, "description": "Ouvre Notes"}},
+  {{"agent": "ComputerControlAgent", "tool": "type_text", "parameters": {{"text": "bonjour"}}, "description": "Écrit bonjour"}}
+]
+
+Si la demande ne correspond à aucune action, retourne [].
+Réponds uniquement avec le JSON.
+"""
+        try:
+            response = self.manager.generate(
+                prompt=prompt,
+                system="",
+                model="nano",
+                temperature=0.1,
+                max_tokens=512,
+                timeout=5.0
+            )
+            cleaned = response.strip()
+            try:
+                actions = json.loads(cleaned)
+            except json.JSONDecodeError:
+                match = re.search(r'(\[.*\])', cleaned, re.DOTALL)
+                if match:
+                    actions = json.loads(match.group(1))
+                else:
+                    raise Exception("Impossible de parser la réponse du LLM")
+
+            if not isinstance(actions, list):
+                raise Exception("La réponse n'est pas une liste")
+
+            if not actions:
+                raise Exception("Aucune action générée")
+
+            results = []
+            for act in actions:
+                agent_name = act.get("agent")
+                tool_name = act.get("tool")
+                params = act.get("parameters", {})
+                agent = self.agents.get(agent_name)
+                if not agent:
+                    raise Exception(f"Agent {agent_name} inconnu")
+                result = asyncio.run(agent.execute_tool(tool_name, params))
+                if result.startswith("❌"):
+                    raise Exception(f"Échec de l'action {tool_name}: {result}")
+                results.append(result)
+            return "\n".join(results)
+
+        except Exception as e:
+            raise Exception(f"Échec de l'interprétation sémantique: {e}")
+
     def _get_cached_response(self, query: str) -> str:
         cached = self.prompt_cache.get(query, system=self.default_system, model="balanced")
         if cached:
@@ -266,15 +449,12 @@ class FrontalCortex:
         raise Exception("Cache miss")
 
     def _call_llm(self, query: str, model_profile: str) -> str:
-        """Appelle le LLM avec le modèle correspondant au profil (nano, speed, balanced)."""
         model_name = self.model_mapping.get(model_profile)
         if not model_name:
             raise Exception(f"Profil de modèle inconnu: {model_profile}")
         enriched_query = self._enrich_query(query)
-        # Timeout dynamique basé sur la longueur de la requête
         word_count = len(query.split())
-        timeout = 5.0 * (1 + word_count / 50)  # max ~15s pour 500 mots
-        timeout = min(timeout, 30.0)
+        timeout = min(5.0 * (1 + word_count / 50), 30.0)
         response = self.manager.generate(
             prompt=enriched_query,
             system=self.default_system,
@@ -311,27 +491,25 @@ class FrontalCortex:
     # -----------------------------------------------------------------------
 
     def _route_simple_action(self, query: str) -> Optional[Tuple[str, Dict]]:
-        """Extrait une action simple d'une requête."""
         q = query.lower()
         for keyword, (agent_name, tool_name) in self.SIMPLE_ACTIONS.items():
             if keyword in q:
-                # Extraction des paramètres selon l'outil
                 if tool_name == "open_application":
-                    # On prend tout après le mot-clé, en supprimant les guillemets éventuels
                     rest = q.replace(keyword, "").strip()
-                    # Si le reste commence par "et" ou "puis", c'est qu'il y a une autre action
                     if rest.startswith(("et", "puis")):
-                        continue  # on ne prend pas cette partie
-                    # Enlever les guillemets si présents
+                        continue
                     rest = re.sub(r'^["\'](.*)["\']$', r'\1', rest)
+                    logger.debug(f"[route] rest avant normalisation: {rest}")
+                    normalized = self.APP_ALIASES.get(rest.lower())
+                    if normalized:
+                        rest = normalized
+                        logger.debug(f"[route] normalisé en: {rest}")
                     return agent_name, {"tool": tool_name, "parameters": {"app_name": rest}}
                 elif tool_name == "type_text":
-                    # Chercher du texte entre guillemets
-                    import re
-                    match = re.search(r'"([^"]+)"', query)
+                    pattern = r'\b' + re.escape(keyword) + r'\s*"([^"]+)"'
+                    match = re.search(pattern, query, re.IGNORECASE)
                     if match:
                         text = match.group(1)
-                        # Vérifier si un nom d'application est spécifié avant
                         app_match = re.search(r'(?:dans|sur)\s+([a-zA-Z]+)', q, re.IGNORECASE)
                         app_name = app_match.group(1) if app_match else None
                         params = {"text": text}
@@ -384,10 +562,9 @@ class FrontalCortex:
         for attempt in range(self.max_plan_retries + 1):
             try:
                 plan = self._generate_plan(query)
-                if plan is not None and self._validate_plan(plan):
+                if plan and self._validate_plan(plan):
                     return plan
-                else:
-                    logger.warning(f"Plan invalide, tentative {attempt+1}")
+                logger.warning(f"Plan invalide, tentative {attempt+1}")
             except Exception as e:
                 logger.error(f"Exception génération plan: {e}")
             if attempt < self.max_plan_retries:
@@ -553,7 +730,6 @@ Réponds uniquement avec le JSON, sinon [].
         start = time.time()
         logger.info(f"🧠 think() - Requête: {query[:50]}...")
 
-        # Obtenir la liste ordonnée des chemins à essayer
         paths = self.action_selector.get_paths_for_query(query)
         logger.info(f"⚡ Chemins possibles: {[p[0] for p in paths]}")
 
@@ -570,9 +746,7 @@ Réponds uniquement avec le JSON, sinon [].
                 logger.warning(f"Chemin {path_id} échoué: {e}")
                 self.action_selector.record_failure(query, path_id)
                 last_error = e
-                # Continuer avec le chemin suivant
 
-        # Si tous les chemins ont échoué, utiliser le fallback sécurisé
         logger.error(f"Tous les chemins ont échoué: {last_error}")
         response = self._safe_fallback(query)
         duration = time.time() - start
@@ -580,5 +754,6 @@ Réponds uniquement avec le JSON, sinon [].
         return response, duration
 
     def stop(self):
+        self.predictor.stop()
         self.executor.shutdown()
         logger.info("Cortex arrêté.")
