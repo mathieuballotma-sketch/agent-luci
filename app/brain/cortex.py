@@ -1,6 +1,6 @@
 """
 Cortex central - Orchestrateur des agents et de la planification
-Version avec prédiction asynchrone (NanoPredictor) pour anticiper les actions.
+Version avec prédicteur asynchrone (nano) et interprétation sémantique.
 """
 
 import asyncio
@@ -37,14 +37,15 @@ from app.brain.synapses.event_bus import EventBus
 class NanoPredictor:
     """
     Prédicteur asynchrone qui analyse le texte tapé en temps réel et prépare des actions potentielles.
-    Utilise le modèle nano (0.5B) pour inférer l'intention.
+    Utilise le modèle nano (0.5B) pour inférer l'intention et stocke la prédiction.
     """
 
-    def __init__(self, manager: ProviderManager, agents: Dict[str, BaseAgent]):
+    def __init__(self, manager: ProviderManager, agents: Dict[str, BaseAgent], model_mapping: dict):
         self.manager = manager
         self.agents = agents
+        self.model_mapping = model_mapping
         self.current_text = ""
-        self.last_prediction = None      # (action_plan, timestamp)
+        self.last_prediction = None  # action candidate au format dict
         self.last_update = 0
         self._lock = threading.RLock()
         self._running = True
@@ -56,13 +57,7 @@ class NanoPredictor:
         """Appelé par le HUD à chaque modification du texte."""
         with self._lock:
             self.current_text = text
-
-    def get_prediction(self) -> Optional[Dict]:
-        """Retourne la dernière prédiction si elle est encore valide (moins de 5 secondes)."""
-        with self._lock:
-            if self.last_prediction and time.time() - self.last_prediction[1] < 5.0:
-                return self.last_prediction[0]
-        return None
+            # La prédiction sera faite dans la boucle _run
 
     def _run(self):
         """Boucle de prédiction : toutes les 1s, si le texte a changé, lance une inférence."""
@@ -77,12 +72,11 @@ class NanoPredictor:
 
     def _predict(self, text: str):
         """Appelle le LLM nano pour interpréter le texte partiel et générer une action candidate."""
-        # Construction du prompt (similaire au semantic parsing)
         tools_desc = []
         for agent_name, agent in self.agents.items():
             for tool in agent.get_tools():
-                # On ne donne que le nom et une description courte pour éviter de surcharger
-                tools_desc.append(f"- {agent_name}.{tool.name}: {tool.description[:100]}")
+                # Description simplifiée
+                tools_desc.append(f"- {agent_name}.{tool.name}: {tool.description}")
         tools_str = "\n".join(tools_desc)
 
         prompt = f"""
@@ -92,40 +86,48 @@ Voici les outils disponibles :
 
 Le début de la demande : "{text}"
 
-Si tu penses pouvoir compléter cette demande en une ou plusieurs actions, retourne une liste JSON d'actions.
-Chaque action a : "agent", "tool", "parameters" (dict), "description" (optionnelle).
-Si tu n'as pas assez d'informations, retourne [].
-Exemple : [{{"agent": "ComputerControlAgent", "tool": "open_application", "parameters": {{"app_name": "Notes"}}, "description": "Ouvre Notes"}}]
-Réponds uniquement avec le JSON.
+Si tu penses pouvoir compléter cette demande en une action unique, retourne un JSON avec l'action au format :
+{{"agent": "...", "tool": "...", "parameters": {{...}}, "description": "..."}}
+Si tu n'es pas sûr ou si le texte est trop vague, retourne {{}}.
+
+Ne retourne que le JSON, rien d'autre.
 """
         try:
+            model_name = self.model_mapping.get("nano", "qwen2.5:0.5b")
             response = self.manager.generate(
                 prompt=prompt,
                 system="",
-                model="nano",
+                model=model_name,
                 temperature=0.1,
                 max_tokens=256,
                 timeout=3.0
             )
             cleaned = response.strip()
-            try:
-                plan = json.loads(cleaned)
-            except json.JSONDecodeError:
-                match = re.search(r'(\[.*\])', cleaned, re.DOTALL)
-                if match:
-                    plan = json.loads(match.group(1))
-                else:
-                    plan = []
-            with self._lock:
-                self.last_prediction = (plan, time.time())
-            logger.debug(f"NanoPredictor: prédiction pour '{text[:30]}...' → {plan}")
+            # Extraire le JSON
+            match = re.search(r'(\{.*\})', cleaned, re.DOTALL)
+            if match:
+                action = json.loads(match.group(1))
+                if action and "agent" in action and "tool" in action:
+                    with self._lock:
+                        self.last_prediction = action
+                        self.last_update = time.time()
+                        logger.debug(f"✅ Prédiction: {action}")
+            else:
+                logger.debug("Prédiction vide")
         except Exception as e:
-            logger.error(f"Erreur dans NanoPredictor: {e}")
+            logger.debug(f"Erreur de prédiction: {e}")
+
+    def get_prediction(self) -> Optional[Dict]:
+        """Retourne la dernière prédiction valide (si elle date de moins de 5 secondes)."""
+        with self._lock:
+            if self.last_prediction and (time.time() - self.last_update) < 5.0:
+                return self.last_prediction
+        return None
 
     def stop(self):
         self._running = False
-        if self._thread.is_alive():
-            self._thread.join(timeout=1)
+        if self._thread:
+            self._thread.join(timeout=2)
 
 
 class ActionSelector:
@@ -186,6 +188,7 @@ class FrontalCortex:
     Cortex frontal - Orchestrateur des agents et de la planification.
     """
 
+    # Actions simples pouvant être routées directement
     SIMPLE_ACTIONS = {
         "ouvre": ("ComputerControlAgent", "open_application"),
         "open": ("ComputerControlAgent", "open_application"),
@@ -244,13 +247,13 @@ class FrontalCortex:
         }
 
         # Prédicteur asynchrone
-        self.predictor = NanoPredictor(manager, self.agents)
+        self.predictor = NanoPredictor(manager, self.agents, self.model_mapping)
 
         self.action_selector = ActionSelector()
         self._register_paths()
 
         self._lock = threading.RLock()
-        logger.info(f"🧠 Cortex avec prédicteur initialisé avec {len(self.agents)} agents")
+        logger.info(f"🧠 Cortex avec prédicteur asynchrone initialisé avec {len(self.agents)} agents")
 
     def _register_agents(self):
         agents_list = [
@@ -269,11 +272,6 @@ class FrontalCortex:
 
     def _register_paths(self):
         self.action_selector.register_path(
-            "prediction_cache",
-            self._execute_prediction_cache,
-            "Action anticipée par le prédicteur"
-        )
-        self.action_selector.register_path(
             "direct_action",
             self._execute_direct_action,
             "Exécution directe d'une action simple (mots-clés)"
@@ -282,6 +280,11 @@ class FrontalCortex:
             "multi_action",
             self._execute_multi_action,
             "Exécution séquentielle de plusieurs actions"
+        )
+        self.action_selector.register_path(
+            "predicted_action",
+            self._execute_predicted_action,
+            "Action prédite par le nano (temps réel)"
         )
         self.action_selector.register_path(
             "semantic_parsing",
@@ -313,27 +316,6 @@ class FrontalCortex:
             self._generate_and_execute_plan,
             "Génération et exécution d'un plan"
         )
-
-    def _execute_prediction_cache(self, query: str) -> str:
-        """Utilise la prédiction anticipée si elle correspond à la requête finale."""
-        pred = self.predictor.get_prediction()
-        if not pred:
-            raise Exception("Aucune prédiction disponible")
-        # On pourrait vérifier que la requête finale correspond au début de la prédiction,
-        # mais ici on fait confiance au prédicteur.
-        results = []
-        for act in pred:
-            agent_name = act.get("agent")
-            tool_name = act.get("tool")
-            params = act.get("parameters", {})
-            agent = self.agents.get(agent_name)
-            if not agent:
-                raise Exception(f"Agent {agent_name} inconnu")
-            result = asyncio.run(agent.execute_tool(tool_name, params))
-            if result.startswith("❌"):
-                raise Exception(f"Échec de l'action {tool_name}: {result}")
-            results.append(result)
-        return "\n".join(results)
 
     def _execute_direct_action(self, query: str) -> str:
         route = self._route_simple_action(query)
@@ -369,9 +351,30 @@ class FrontalCortex:
             return "\n".join(results)
         raise Exception("Aucune action multiple trouvée")
 
+    def _execute_predicted_action(self, query: str) -> str:
+        """Utilise la prédiction du nano si elle correspond à la requête finale."""
+        prediction = self.predictor.get_prediction()
+        if not prediction:
+            raise Exception("Aucune prédiction disponible")
+        # Vérifier que la requête actuelle est suffisamment similaire à celle qui a généré la prédiction
+        # (on pourrait comparer les embeddings, mais pour simplifier, on exécute)
+        agent_name = prediction.get("agent")
+        tool_name = prediction.get("tool")
+        params = prediction.get("parameters", {})
+        if not agent_name or not tool_name:
+            raise Exception("Prédiction incomplète")
+        agent = self.agents.get(agent_name)
+        if not agent:
+            raise Exception(f"Agent {agent_name} inconnu")
+        result = asyncio.run(agent.execute_tool(tool_name, params))
+        if result.startswith("❌"):
+            raise Exception(f"Échec de l'action prédite: {result}")
+        return result
+
     def _execute_semantic_parsing(self, query: str) -> str:
-        """Interprète la requête avec le LLM nano et exécute les actions."""
-        # Construction du prompt
+        """
+        Utilise le LLM nano pour interpréter la requête et produire une liste d'actions structurées.
+        """
         tools_desc = []
         for agent_name, agent in self.agents.items():
             for tool in agent.get_tools():
@@ -386,10 +389,10 @@ Voici les outils disponibles :
 La demande : "{query}"
 
 Génère une liste d'actions au format JSON. Chaque action a :
-- "agent": nom de l'agent
-- "tool": nom de l'outil
-- "parameters": dictionnaire des paramètres
-- "description": courte description (optionnelle)
+- "agent": nom de l'agent (ex: ComputerControlAgent)
+- "tool": nom de l'outil (ex: open_application)
+- "parameters": dictionnaire des paramètres (respecte le schéma de l'outil)
+- "description": courte description de l'action (optionnelle)
 
 Exemple pour "ouvre notes et écris bonjour" :
 [
@@ -401,10 +404,11 @@ Si la demande ne correspond à aucune action, retourne [].
 Réponds uniquement avec le JSON.
 """
         try:
+            model_name = self.model_mapping.get("nano", "qwen2.5:0.5b")
             response = self.manager.generate(
                 prompt=prompt,
                 system="",
-                model="nano",
+                model=model_name,
                 temperature=0.1,
                 max_tokens=512,
                 timeout=5.0
@@ -425,6 +429,7 @@ Réponds uniquement avec le JSON.
             if not actions:
                 raise Exception("Aucune action générée")
 
+            # Exécuter les actions séquentiellement
             results = []
             for act in actions:
                 agent_name = act.get("agent")

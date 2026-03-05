@@ -1,3 +1,5 @@
+# app/ui/hud_native.py
+
 import objc
 from PyObjCTools import AppHelper
 import AppKit
@@ -119,14 +121,11 @@ class HUDWindow(AppKit.NSPanel):
         self._is_dragging  = False
         self._is_processing = False
         self._processing_start_time = 0
+        self.engine = None  # sera injecté plus tard
 
         self._setup_ui()
         self._setup_space_observer()
         self._setup_watchdog()
-
-        # Variables pour la surveillance de la frappe
-        self._typing_timer = None
-        self._last_text = ""
 
         print("✅ HUDPanel initialisé avec effet verre")
         return self
@@ -325,8 +324,39 @@ class HUDWindow(AppKit.NSPanel):
         self._status_text.setTextColor_(ns_white(0.7, 0.8))
         content.addSubview_(self._status_text)
 
-        # Démarrer la surveillance de la frappe
+        # Initialisation pour le prédicteur
+        self._last_text = ""
+        self._typing_timer = None
         self._start_typing_monitor()
+
+    def _start_typing_monitor(self):
+        """Lance le timer de surveillance de la frappe."""
+        def check_text():
+            current = self._input.stringValue()
+            if current != self._last_text:
+                self._last_text = current
+                threading.Thread(target=self._send_to_predictor, args=(current,), daemon=True).start()
+            self._typing_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.5, self, 'typingTimerFired:', None, False
+            )
+        check_text()
+
+    @objc.IBAction
+    def typingTimerFired_(self, timer):
+        """Appelé par le timer toutes les 0.5s."""
+        current = self._input.stringValue()
+        if current != self._last_text:
+            self._last_text = current
+            threading.Thread(target=self._send_to_predictor, args=(current,), daemon=True).start()
+        # Relancer le timer
+        self._typing_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.5, self, 'typingTimerFired:', None, False
+        )
+
+    def _send_to_predictor(self, text: str):
+        """Envoie le texte partiel au prédicteur (via l'engine)."""
+        if hasattr(self, 'engine') and self.engine and hasattr(self.engine, 'predictor'):
+            self.engine.predictor.update_partial_input(text)
 
     def _setup_space_observer(self):
         nc = AppKit.NSWorkspace.sharedWorkspace().notificationCenter()
@@ -360,38 +390,6 @@ class HUDWindow(AppKit.NSPanel):
         self.setLevel_(Quartz.kCGFloatingWindowLevel + 1)
         self.orderFrontRegardless()
 
-    # -------------------------------------------------------------
-    # Surveillance de la frappe
-    # -------------------------------------------------------------
-    def _start_typing_monitor(self):
-        """Lance un timer qui surveille le contenu du champ de saisie toutes les 0.5s."""
-        self._typing_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            0.5, self, 'typingTimerFired:', None, True
-        )
-        # Forcer un premier appel
-        self.typingTimerFired_(None)
-
-    @objc.IBAction
-    def typingTimerFired_(self, timer):
-        """Appelé par le timer toutes les 0.5s."""
-        current = self._input.stringValue()
-        if current != self._last_text:
-            self._last_text = current
-            # Envoyer le texte partiel au prédicteur dans un thread séparé
-            if hasattr(self, 'engine') and self.engine and hasattr(self.engine, 'predictor'):
-                threading.Thread(target=self._send_to_predictor, args=(current,), daemon=True).start()
-
-    def _send_to_predictor(self, text: str):
-        """Envoie le texte partiel au service de prédiction de l'engine."""
-        try:
-            self.engine.predictor.update_partial_input(text)
-        except Exception as e:
-            # Silencieux pour ne pas perturber l'utilisateur
-            pass
-
-    # -------------------------------------------------------------
-    # Envoi de la requête
-    # -------------------------------------------------------------
     @objc.IBAction
     def sendQuery_(self, sender):
         print("🚀 sendQuery_ appelée")
@@ -424,7 +422,7 @@ class HUDWindow(AppKit.NSPanel):
         try:
             # Afficher un message de début de réflexion
             AppHelper.callAfter(self.append_message_safe, "Agent", "Je réfléchis...", False)
-            time.sleep(0.5)
+            time.sleep(0.5)  # Petite pause pour que l'utilisateur voie le message
 
             print("Appel de self.engine.process...")
             response, latency = self.engine.process(query, use_rag=True)
@@ -549,8 +547,6 @@ class HUDWindow(AppKit.NSPanel):
     def close(self):
         if hasattr(self, '_watchdog') and self._watchdog:
             self._watchdog.invalidate()
-        if hasattr(self, '_typing_timer') and self._typing_timer:
-            self._typing_timer.invalidate()
         nc = AppKit.NSWorkspace.sharedWorkspace().notificationCenter()
         nc.removeObserver_(self)
         objc.super(HUDWindow, self).close()
