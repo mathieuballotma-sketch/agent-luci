@@ -1,6 +1,6 @@
 """
 Cortex central - Orchestrateur des agents et de la planification
-Version avec prédicteur asynchrone (nano) et interprétation sémantique.
+Version avec prédicteur asynchrone et détection améliorée du texte sans guillemets.
 """
 
 import asyncio
@@ -57,13 +57,12 @@ class NanoPredictor:
         """Appelé par le HUD à chaque modification du texte."""
         with self._lock:
             self.current_text = text
-            # La prédiction sera faite dans la boucle _run
 
     def _run(self):
-        """Boucle de prédiction : toutes les 1s, si le texte a changé, lance une inférence."""
+        """Boucle de prédiction : toutes les 0.5s, si le texte a changé, lance une inférence."""
         last_text = ""
         while self._running:
-            time.sleep(1.0)
+            time.sleep(0.5)
             with self._lock:
                 text = self.current_text
             if text and text != last_text and len(text) > 3:
@@ -75,7 +74,6 @@ class NanoPredictor:
         tools_desc = []
         for agent_name, agent in self.agents.items():
             for tool in agent.get_tools():
-                # Description simplifiée
                 tools_desc.append(f"- {agent_name}.{tool.name}: {tool.description}")
         tools_str = "\n".join(tools_desc)
 
@@ -100,10 +98,9 @@ Ne retourne que le JSON, rien d'autre.
                 model=model_name,
                 temperature=0.1,
                 max_tokens=256,
-                timeout=3.0
+                timeout=2.0  # timeout réduit pour ne pas bloquer
             )
             cleaned = response.strip()
-            # Extraire le JSON
             match = re.search(r'(\{.*\})', cleaned, re.DOTALL)
             if match:
                 action = json.loads(match.group(1))
@@ -118,9 +115,9 @@ Ne retourne que le JSON, rien d'autre.
             logger.debug(f"Erreur de prédiction: {e}")
 
     def get_prediction(self) -> Optional[Dict]:
-        """Retourne la dernière prédiction valide (si elle date de moins de 5 secondes)."""
+        """Retourne la dernière prédiction valide (si elle date de moins de 3 secondes)."""
         with self._lock:
-            if self.last_prediction and (time.time() - self.last_update) < 5.0:
+            if self.last_prediction and (time.time() - self.last_update) < 3.0:
                 return self.last_prediction
         return None
 
@@ -356,8 +353,6 @@ class FrontalCortex:
         prediction = self.predictor.get_prediction()
         if not prediction:
             raise Exception("Aucune prédiction disponible")
-        # Vérifier que la requête actuelle est suffisamment similaire à celle qui a généré la prédiction
-        # (on pourrait comparer les embeddings, mais pour simplifier, on exécute)
         agent_name = prediction.get("agent")
         tool_name = prediction.get("tool")
         params = prediction.get("parameters", {})
@@ -411,7 +406,7 @@ Réponds uniquement avec le JSON.
                 model=model_name,
                 temperature=0.1,
                 max_tokens=512,
-                timeout=5.0
+                timeout=3.0  # timeout réduit
             )
             cleaned = response.strip()
             try:
@@ -429,7 +424,6 @@ Réponds uniquement avec le JSON.
             if not actions:
                 raise Exception("Aucune action générée")
 
-            # Exécuter les actions séquentiellement
             results = []
             for act in actions:
                 agent_name = act.get("agent")
@@ -496,6 +490,10 @@ Réponds uniquement avec le JSON.
     # -----------------------------------------------------------------------
 
     def _route_simple_action(self, query: str) -> Optional[Tuple[str, Dict]]:
+        """
+        Extrait une action simple d'une requête ou d'une sous-partie.
+        Pour type_text, capture le texte même sans guillemets (tout le reste de la chaîne).
+        """
         q = query.lower()
         for keyword, (agent_name, tool_name) in self.SIMPLE_ACTIONS.items():
             if keyword in q:
@@ -511,16 +509,25 @@ Réponds uniquement avec le JSON.
                         logger.debug(f"[route] normalisé en: {rest}")
                     return agent_name, {"tool": tool_name, "parameters": {"app_name": rest}}
                 elif tool_name == "type_text":
+                    # Chercher d'abord du texte entre guillemets
                     pattern = r'\b' + re.escape(keyword) + r'\s*"([^"]+)"'
                     match = re.search(pattern, query, re.IGNORECASE)
                     if match:
                         text = match.group(1)
-                        app_match = re.search(r'(?:dans|sur)\s+([a-zA-Z]+)', q, re.IGNORECASE)
-                        app_name = app_match.group(1) if app_match else None
-                        params = {"text": text}
-                        if app_name:
-                            params["app_name"] = app_name
-                        return agent_name, {"tool": tool_name, "parameters": params}
+                    else:
+                        # Pas de guillemets : prendre tout ce qui suit le mot-clé jusqu'à la fin
+                        # On enlève le mot-clé et on nettoie
+                        text = query.replace(keyword, "", 1).strip()
+                        # Si le texte commence par "et" ou "puis", c'est qu'il y a une autre action, on ignore
+                        if text.lower().startswith(("et", "puis")):
+                            return None
+                    # Chercher une application cible après "dans" ou "sur"
+                    app_match = re.search(r'(?:dans|sur)\s+([a-zA-Z]+)', q, re.IGNORECASE)
+                    app_name = app_match.group(1) if app_match else None
+                    params = {"text": text}
+                    if app_name:
+                        params["app_name"] = app_name
+                    return agent_name, {"tool": tool_name, "parameters": params}
                 elif tool_name == "click":
                     match = re.search(r'(\d+)[,\s]+(\d+)', query)
                     if match:

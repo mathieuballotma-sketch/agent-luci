@@ -1,6 +1,6 @@
 """
 BaseAgent - Classe de base pour tous les agents.
-v3 : ajout de ask_llm_async et implémentation par défaut de handle.
+v3 : ajout de ask_llm_async, implémentation par défaut de handle et publication d'erreurs.
 """
 
 import asyncio
@@ -37,6 +37,8 @@ class BaseAgent(ABC):
         self.llm = llm_service
         self.bus = bus
         self._tools_cache: Optional[Dict[str, Tool]] = None
+        # Référence à l'event bus (sera injectée par le cortex)
+        self.event_bus = None
         logger.info(f"🤖 Agent '{self.name}' initialisé")
 
     @abstractmethod
@@ -99,7 +101,18 @@ class BaseAgent(ABC):
             duration = time.time() - start
             logger.error(f"Erreur exécution [{tool_name}]: {e}")
             tool_execution_errors.labels(agent=self.name, tool=tool_name).inc()
+            # Publier l'erreur sur le bus d'événements
+            asyncio.create_task(self._publish_error(tool_name, str(e)))
             return f"Erreur lors de l'exécution: {str(e)}"
+
+    async def _publish_error(self, tool: str, error: str):
+        """Publie une erreur d'outil sur le bus d'événements."""
+        if self.event_bus:
+            await self.event_bus.publish(
+                "tool.error",
+                {"agent": self.name, "tool": tool, "error": error},
+                self.name
+            )
 
     def ask_llm(self, prompt: str, system_prompt: Optional[str] = None,
                 model: str = "balanced", temperature: float = 0.5,

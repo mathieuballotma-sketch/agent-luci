@@ -12,7 +12,7 @@ from ..utils.logger import logger
 llm_requests_total = Counter(
     'llm_requests_total',
     'Total des requêtes LLM',
-    ['model', 'status']  # status: success, error
+    ['model', 'status']
 )
 
 llm_request_duration_seconds = Histogram(
@@ -40,7 +40,7 @@ tool_execution_errors = Counter(
 cache_hits = Counter(
     'cache_hits_total',
     'Nombre de hits dans le cache',
-    ['cache_type']  # exact, vector
+    ['cache_type']
 )
 
 cache_misses = Counter(
@@ -151,15 +151,34 @@ cortex_step_duration = Histogram(
     buckets=(0.001, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0)
 )
 
+# Métriques de l'agent cyber
+cyber_errors_detected = Counter(
+    'cyber_errors_detected_total',
+    'Nombre d erreurs détectées par l agent cyber',
+    ['agent', 'tool']
+)
+
+cyber_threats_shared = Counter(
+    'cyber_threats_shared_total',
+    'Nombre de menaces partagées avec le réseau'
+)
+
+cyber_immunity_updates = Counter(
+    'cyber_immunity_updates_total',
+    'Nombre de mises à jour d immunité reçues du réseau'
+)
+
+cyber_quarantine_actions = Counter(
+    'cyber_quarantine_actions_total',
+    'Nombre de mises en quarantaine d outils',
+    ['agent', 'tool']
+)
+
 # Thread pour le serveur Prometheus
 _metrics_server_thread = None
 
 
 def start_metrics_server(port: int = 8001):
-    """
-    Démarre un serveur HTTP exposant les métriques Prometheus.
-    À appeler au démarrage de l'application si activé.
-    """
     global _metrics_server_thread
     if _metrics_server_thread is not None:
         logger.warning("Serveur de métriques déjà démarré.")
@@ -178,7 +197,7 @@ def start_metrics_server(port: int = 8001):
     _metrics_server_thread.start()
 
 
-# Fonctions utilitaires pour enregistrer les métriques facilement
+# Fonctions utilitaires
 def record_llm_request(model: str, duration: float, status: str = "success"):
     llm_requests_total.labels(model=model, status=status).inc()
     if status == "success":
@@ -232,10 +251,8 @@ def set_working_memory_size(size: int):
 
 
 def record_strategist_suggestion(category: str = "other"):
-    """Incrémente le compteur de suggestions du stratège."""
     strategist_suggestions_total.labels(category=category).inc()
 
 
 def record_cortex_step(step: str, duration: float):
-    """Enregistre la durée d'une étape du cortex."""
     cortex_step_duration.labels(step=step).observe(duration)

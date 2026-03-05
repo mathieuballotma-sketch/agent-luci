@@ -3,7 +3,7 @@
 Agent de contrôle de l'ordinateur — version étendue.
 Ajoute des outils pour Mail, Safari et l'organisation des fenêtres.
 Version avec arrangement de fenêtres amélioré (création de fenêtre pour Mail).
-Optimisé pour la rapidité : vérification préalable pour open_application, etc.
+Optimisé pour la rapidité : timeouts réduits, polling plus fréquent.
 """
 
 import asyncio
@@ -172,7 +172,8 @@ class ComputerControlAgent(BaseAgent):
     # -----------------------------------------------------------------------
     # Méthodes auxiliaires asynchrones
     # -----------------------------------------------------------------------
-    async def _run_applescript(self, script: str, timeout: float = 10.0) -> tuple[bool, str]:
+    async def _run_applescript(self, script: str, timeout: float = 5.0) -> tuple[bool, str]:
+        """Exécute un AppleScript avec un timeout (5s par défaut)."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "osascript", "-e", script,
@@ -192,7 +193,7 @@ class ComputerControlAgent(BaseAgent):
 
     async def _activate_app(self, app_name: str):
         script = f'tell application "{app_name}" to activate'
-        await self._run_applescript(script)
+        await self._run_applescript(script, timeout=3.0)
 
     def _get_active_app_name(self) -> Optional[str]:
         if not FOUND_APPKIT:
@@ -205,13 +206,14 @@ class ComputerControlAgent(BaseAgent):
             logger.debug(f"Erreur get_active_app_name : {e}")
             return None
 
-    async def _wait_for_app_active(self, app_name: str, timeout: float = 5.0) -> bool:
+    async def _wait_for_app_active(self, app_name: str, timeout: float = 2.0) -> bool:
+        """Attend que l'application devienne active avec un polling rapide."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             active = self._get_active_app_name()
             if active and app_name.lower() in active.lower():
                 return True
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
         logger.warning(f"'{app_name}' non détectée au premier plan après {timeout}s")
         return False
 
@@ -224,7 +226,7 @@ class ComputerControlAgent(BaseAgent):
             keystroke "n" using command down
         end tell
         """
-        success, error = await self._run_applescript(script)
+        success, error = await self._run_applescript(script, timeout=3.0)
         if not success:
             logger.error(f"Création de note échouée : {error}")
         return success
@@ -242,7 +244,7 @@ class ComputerControlAgent(BaseAgent):
                 await proc.communicate(input=text.encode('utf-8'))
                 await asyncio.sleep(0.1)
                 script = 'tell application "System Events" to keystroke "v" using command down'
-                success, error = await self._run_applescript(script)
+                success, error = await self._run_applescript(script, timeout=2.0)
                 return success
             except Exception as e:
                 logger.error(f"Erreur collage AppleScript: {e}")
@@ -256,7 +258,7 @@ class ComputerControlAgent(BaseAgent):
                 delay {interval}
             end repeat
             """
-            success, error = await self._run_applescript(script)
+            success, error = await self._run_applescript(script, timeout=5.0)
             if not success:
                 logger.error(f"AppleScript typing échoué : {error}")
             return success
@@ -266,13 +268,13 @@ class ComputerControlAgent(BaseAgent):
     # -----------------------------------------------------------------------
     async def _tool_open_application(self, app_name: str) -> str:
         start = time.time()
-        # Vérifier si l'application est déjà ouverte
+        # Vérifier si l'application est déjà ouverte (timeout court)
         check_script = f'''
         tell application "System Events"
             return (exists process "{app_name}")
         end tell
         '''
-        success, output = await self._run_applescript(check_script)
+        success, output = await self._run_applescript(check_script, timeout=3.0)
         if success and output.strip().lower() == "true":
             # Déjà ouverte → simple activation
             await self._activate_app(app_name)
@@ -291,7 +293,8 @@ class ComputerControlAgent(BaseAgent):
                 logger.error(f"Échec ouverture '{app_name}' : {error_msg}")
                 record_tool_execution(self.name, "open_application", time.time() - start, error=True)
                 return f"❌ Impossible d'ouvrir '{app_name}' : {error_msg}"
-            await self._wait_for_app_active(app_name, timeout=5.0)
+            # Attendre que l'application devienne active (timeout réduit)
+            await self._wait_for_app_active(app_name, timeout=2.0)
             await self._activate_app(app_name)
             record_tool_execution(self.name, "open_application", time.time() - start, error=False)
             return f"✅ Application '{app_name}' ouverte."
@@ -308,7 +311,7 @@ class ComputerControlAgent(BaseAgent):
         target_app = app_name
         if app_name:
             await self._activate_app(app_name)
-            await self._wait_for_app_active(app_name, timeout=3.0)
+            await self._wait_for_app_active(app_name, timeout=2.0)
         else:
             active = self._get_active_app_name()
             if active and any(n in active.lower() for n in NOTES_APPS):
@@ -318,7 +321,7 @@ class ComputerControlAgent(BaseAgent):
             if not await self._create_new_note_in_notes():
                 logger.warning("   → Fallback : Cmd+N via pyautogui")
                 pyautogui.hotkey('command', 'n')
-            await self._wait_for_app_active("Notes", timeout=3.0)
+            await self._wait_for_app_active("Notes", timeout=2.0)
         if target_app and any(n in target_app.lower() for n in NOTES_APPS):
             logger.info("   → Utilisation d'AppleScript avec collage pour Notes")
             success = await self._type_text_with_applescript(text, interval, use_paste=True)
@@ -412,7 +415,7 @@ class ComputerControlAgent(BaseAgent):
                 {"send newMessage" if send else ""}
             end tell
             '''
-            success, error = await self._run_applescript(script)
+            success, error = await self._run_applescript(script, timeout=10.0)
             if success:
                 action = "envoyé" if send else "préparé"
                 record_tool_execution(self.name, "mail_compose", time.time() - start, error=False)
@@ -429,7 +432,7 @@ class ComputerControlAgent(BaseAgent):
         start = time.time()
         try:
             await self._activate_app("Safari")
-            await self._wait_for_app_active("Safari", timeout=3.0)
+            await self._wait_for_app_active("Safari", timeout=2.0)
             if new_tab:
                 script = f'''
                 tell application "Safari"
@@ -440,7 +443,7 @@ class ComputerControlAgent(BaseAgent):
                 script = f'''
                 tell application "Safari" to set URL of document 1 to "{url}"
                 '''
-            success, error = await self._run_applescript(script)
+            success, error = await self._run_applescript(script, timeout=5.0)
             if success:
                 record_tool_execution(self.name, "safari_open_url", time.time() - start, error=False)
                 return f"✅ URL ouverte dans Safari."
@@ -476,7 +479,7 @@ class ComputerControlAgent(BaseAgent):
             
             # Activer l'application et attendre qu'elle soit active
             await self._activate_app(app)
-            if not await self._wait_for_app_active(app, timeout=5.0):
+            if not await self._wait_for_app_active(app, timeout=3.0):
                 errors.append(f"{app} ne s'est pas activée")
                 continue
             
@@ -495,20 +498,19 @@ class ComputerControlAgent(BaseAgent):
                     end if
                 end tell
                 '''
-                success, output = await self._run_applescript(check_script)
+                success, output = await self._run_applescript(check_script, timeout=3.0)
                 if not success or "false" in output.lower():
                     logger.info("Aucune fenêtre Mail trouvée, création d'une nouvelle fenêtre")
-                    # Ouvrir une nouvelle fenêtre (la boîte de réception)
                     new_window_script = '''
                     tell application "Mail"
                         activate
                         make new window
                     end tell
                     '''
-                    await self._run_applescript(new_window_script)
-                    await asyncio.sleep(1.0)  # Laisser le temps à la fenêtre de s'ouvrir
+                    await self._run_applescript(new_window_script, timeout=3.0)
+                    await asyncio.sleep(1.0)
             
-            # Maintenant, positionner la fenêtre
+            # Positionner la fenêtre
             x = 0 if i == 0 else half_width
             script = f'''
             tell application "System Events"
@@ -519,7 +521,7 @@ class ComputerControlAgent(BaseAgent):
             end tell
             '''
             logger.debug(f"Script pour {app} : {script}")
-            success, err = await self._run_applescript(script)
+            success, err = await self._run_applescript(script, timeout=5.0)
             if not success:
                 logger.error(f"Erreur arrangement pour {app}: {err}")
                 errors.append(f"{app}: {err}")
@@ -548,7 +550,6 @@ class ComputerControlAgent(BaseAgent):
             x, y = positions[i]
             await self._activate_app(app)
             await asyncio.sleep(0.5)
-            # Pour chaque app, on pourrait aussi vérifier l'existence d'une fenêtre, mais on suppose qu'elles en ont
             script = f'''
             tell application "System Events"
                 tell process "{app}"
@@ -557,7 +558,7 @@ class ComputerControlAgent(BaseAgent):
                 end tell
             end tell
             '''
-            success, err = await self._run_applescript(script)
+            success, err = await self._run_applescript(script, timeout=5.0)
             if not success:
                 errors.append(f"{app}: {err}")
         if errors:
@@ -666,7 +667,6 @@ class ComputerControlAgent(BaseAgent):
                 for app in KNOWN_APPS:
                     if app in q:
                         apps.append(app.capitalize())
-                # Si aucune application explicite, on passe ce qui a été trouvé
                 return await self._tool_arrange_windows(layout=layout, apps=apps if apps else None)
             return "❓ Précise la disposition souhaitée (ex: 'côte à côte', 'grille')."
 

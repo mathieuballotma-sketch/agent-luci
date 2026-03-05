@@ -1,8 +1,7 @@
 """
 Moteur principal de l'application.
 Coordonne le cortex, les services, la mémoire et les agents.
-Intègre désormais un scheduler pour les tâches périodiques et un agent stratège
-qui génère automatiquement des suggestions d'automatisation.
+Intègre désormais l'agent Cyber.
 """
 
 import asyncio
@@ -32,6 +31,7 @@ from ..memory import MemoryService, EpisodicMemory, WorkingMemory, Consolidation
 from ..core.elasticity import ElasticityEngine
 from ..agents.profile_agent import ProfileAgent
 from ..agents.strategist_agent import StrategistAgent
+from ..agents.cyber_agent import CyberAgent
 
 
 class LucidEngine:
@@ -40,7 +40,6 @@ class LucidEngine:
         self.bus = SynapseBus()
         self.event_bus = EventBus()
 
-        # Démarrer les métriques (optionnel)
         if config.metrics.enabled:
             start_metrics_server(port=config.metrics.port)
             monitor_memory(interval=config.metrics.memory_interval)
@@ -52,7 +51,7 @@ class LucidEngine:
         self.prompt_cache = PromptCache(cache_dir=data_dir / "cache", max_size=10000)
         self.ollama_circuit = CircuitBreaker("ollama", failure_threshold=3, recovery_timeout=30)
 
-        # Initialisation de la mémoire
+        # Mémoire
         episodic = EpisodicMemory(
             persist_directory=str(data_dir / "episodic"),
             max_entries=config.memory.max_episodic
@@ -60,7 +59,7 @@ class LucidEngine:
         working = WorkingMemory(capacity=config.memory.working_capacity)
         self.memory = MemoryService(episodic, working)
 
-        # Consolidation (optionnelle)
+        # Consolidation
         self.consolidation = ConsolidationEngine(
             episodic,
             interval=config.memory.consolidation_interval
@@ -68,7 +67,7 @@ class LucidEngine:
         if config.memory.auto_consolidate:
             self.consolidation.start()
 
-        # Élasticité matérielle (convertir la dataclass en dict)
+        # Élasticité
         self.elasticity = ElasticityEngine(asdict(config.elasticity))
         self.elasticity.start()
 
@@ -99,7 +98,7 @@ class LucidEngine:
             }
         )
 
-        # ProfileAgent (arrière‑plan)
+        # ProfileAgent
         self.profile_agent = ProfileAgent(
             llm_service=self.manager,
             bus=self.bus,
@@ -118,21 +117,28 @@ class LucidEngine:
             memory_service=self.memory,
             config=asdict(config)
         )
-
-        # Démarrer le scheduler avant d'ajouter des jobs
         self.scheduler.start()
-
-        # Ajouter une tâche cron pour le strategist (toutes les heures)
         self.scheduler.add_cron_job(
             func=self.strategist.run_periodic_review,
-            cron_expr="0 * * * *",      # toutes les heures
+            cron_expr="0 * * * *",
             job_id="strategist_review"
         )
 
-        # Souscrire aux suggestions pour les exécuter automatiquement
+        # Agent Cyber
+        self.cyber_agent = CyberAgent(
+            llm_service=self.manager,
+            bus=self.bus,
+            event_bus=self.event_bus,
+            config=asdict(config),
+            memory_service=self.memory
+        )
+        # On connecte l'event_bus aux agents (pour la publication d'erreurs)
+        for agent in self.cortex.agents.values():
+            agent.event_bus = self.event_bus
+        # Souscrire aux suggestions
         self.event_bus.subscribe("strategist.suggestion", self._handle_suggestion)
 
-        logger.info("✅ Moteur Lucide initialisé avec mémoire, élasticité, profil, scheduler et stratège")
+        logger.info("✅ Moteur Lucide initialisé avec mémoire, élasticité, profil, scheduler, stratège et cyber")
 
     def _init_llm(self):
         models_config = {}
@@ -153,9 +159,6 @@ class LucidEngine:
         logger.info(f"⚙️ Engine.process() - Requête: {query[:50]}...")
 
         rag_context = self.rag.query(query) if use_rag else ""
-        full_context = ""
-        if rag_context:
-            full_context += f"Documents pertinents:\n{rag_context}\n\n"
 
         try:
             raw_response, _ = self.ollama_circuit.call(
@@ -191,10 +194,6 @@ class LucidEngine:
         return self.rag.index_folder(path)
 
     def _handle_suggestion(self, data, event_id, source):
-        """
-        Gère une suggestion du stratège : si elle contient une expression cron et une requête,
-        l'ajoute automatiquement au scheduler.
-        """
         logger.info(f"💡 Réception suggestion: {data.get('title', 'sans titre')}")
         cron = data.get("cron_expression")
         query = data.get("query")
@@ -205,7 +204,7 @@ class LucidEngine:
                     logger.warning(f"Expression cron invalide: {cron}")
                     return
             except ImportError:
-                pass  # croniter pas installé, on tente quand même
+                pass
             self.scheduler.add_cron_job(
                 func=self._execute_scheduled_query,
                 cron_expr=cron,
@@ -214,10 +213,9 @@ class LucidEngine:
             )
             logger.info(f"📅 Tâche automatique ajoutée: {data.get('title')}")
         else:
-            logger.debug("Suggestion sans cron/query, ignorée pour exécution automatique")
+            logger.debug("Suggestion sans cron/query, ignorée")
 
     async def _execute_scheduled_query(self, query: str):
-        """Exécute une requête planifiée (asynchrone)."""
         logger.info(f"⏰ Exécution programmée: {query}")
         try:
             response, latency = await self.process_async(query, use_rag=False)
@@ -226,7 +224,6 @@ class LucidEngine:
             logger.error(f"❌ Erreur exécution programmée: {e}")
 
     def stop(self):
-        """Arrêt propre du moteur et de tous ses composants."""
         self.executor.shutdown()
         self.cortex.stop()
         self.consolidation.stop()
@@ -234,4 +231,6 @@ class LucidEngine:
         self.profile_agent.stop()
         if hasattr(self, 'scheduler'):
             self.scheduler.stop()
+        if hasattr(self, 'cyber_agent'):
+            self.cyber_agent.stop()
         logger.info("Moteur arrêté.")
